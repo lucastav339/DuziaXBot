@@ -283,7 +283,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(update, html)
 
 async def cmd_assinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = "https://seu-psp.com/pagar/SEU_PRODUTO"
+    link = "https://mpago.li/1cHXVHc"
     await send_html(update, "💳 <b>Assinatura</b>\\n"
                             f"Acesso por {SUB_DAYS} dias.\\n\\n"
                             f"➡️ Pague aqui: <a href=\\"{link}\\">Finalizar pagamento</a>\\n"
