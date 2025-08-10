@@ -249,6 +249,7 @@ async def cmd_resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(update, "🔄 Contadores zerados.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Recebi, analisando...")
     # Comandos públicos sempre permitidos
     txt = (update.message.text or "").strip().lower()
     if txt in ["/start","/assinar","/status","/version"]:
