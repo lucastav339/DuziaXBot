@@ -308,7 +308,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # AIOHTTP app (Telegram + Payments + Health)
 # =========================
 application = Application.builder().token(TOKEN).build()
+# 1) Tap de debug: roda antes de qualquer outro handler (group -1)
+application.add_handler(MessageHandler(filters.ALL, debug_tap), group=-1)
 
+# 2) Handler de erro global
+application.add_error_handler(on_error)
 application.add_handler(CommandHandler("version", cmd_version))
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("assinar", cmd_assinar))
