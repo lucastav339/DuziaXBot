@@ -8,6 +8,28 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 import redis.asyncio as redis
 from aiohttp import web
+import logging
+logging.basicConfig(level=logging.INFO)
+
+async def debug_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update and update.message:
+            logging.info(f"[DBG] Chat {update.effective_chat.id} -> {update.message.text!r}")
+    except Exception as e:
+        logging.exception("Erro no debug_tap")
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    logging.error("PTB ERROR:\n%s", tb)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Ocorreu um erro interno. Já registrei nos logs."
+            )
+    except Exception:
+        pass
 
 # =========================
 # Config & Globals
