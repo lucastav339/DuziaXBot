@@ -284,10 +284,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_assinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = "https://mpago.li/1cHXVHc"
-    await send_html(update, "💳 <b>Assinatura</b>\\n"
-                            f"Acesso por {SUB_DAYS} dias.\\n\\n"
-                            f"➡️ Pague aqui: <a href=\\"{link}\\">Finalizar pagamento</a>\\n"
-                            "Assim que aprovado, liberamos automaticamente. Use /status para conferir.")
+    await send_html(update,
+    "💳 <b>Assinatura</b>\n"
+    f"Acesso por {SUB_DAYS} dias.\n\n"
+    f"➡️ Pague aqui: <a href='{link}'>Finalizar pagamento</a>\n"
+    "Assim que aprovado, liberamos automaticamente. Use /status para conferir."
+)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -320,8 +322,9 @@ async def require_active_or_trial(update: Update) -> bool:
     if trial_allows(trial):
         return True
     link = "https://seu-psp.com/pagar/SEU_PRODUTO"
-    await send_html(update, "🔒 <b>Seu teste terminou</b>.\\n"
-                            f"Para continuar por {SUB_DAYS} dias: <a href=\\"{link}\\">assine aqui</a>.")
+    await send_html(update, "🔒 <b>Seu teste terminou</b>.\n"
+                        f"Para continuar por {SUB_DAYS} dias: <a href='{link}'>assine aqui</a>.")
+
     return False
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -413,10 +416,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nums_now = [int(x) for x in re.findall(r"\\d+", update.message.text or "")]
     hit_limit_now = await score_predictions(uid, nums_now)
     if hit_limit_now and not PAYWALL_OFF:
-        link = "https://seu-psp.com/pagar/SEU_PRODUTO"
-        await send_html(update, "🆓 <b>Período de teste encerrado</b> — você atingiu o limite de "
-                                f"<b>{TRIAL_MAX_HITS} acertos</b>.\\n"
-                                f"Para continuar por {SUB_DAYS} dias: <a href=\\"{link}\\">assine aqui</a>.")
+        link = "https://mpago.li/1cHXVHc"
+        await send_html(update,
+    "🆓 <b>Período de teste encerrado</b> — você atingiu o limite de "
+    f"<b>{TRIAL_MAX_HITS} acertos</b>.\n"
+    f"Para continuar por {SUB_DAYS} dias: <a href='{link}'>assine aqui</a>."
+)
         return
     if not await require_active_or_trial(update):
         return
