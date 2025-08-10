@@ -258,50 +258,41 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
     uid = update.effective_user.id
+
     if not PAYWALL_OFF and rds:
         paid = await get_active_until(uid)
         if not paid:
             await set_trial_start_if_absent(uid)
+
     trial = await get_trial_info(uid)
+
     trial_line = ""
     if trial["enabled"]:
         if trial_allows(trial):
             parts = []
-            if trial["hits_left"] is not None: parts.append(f"{trial['hits_left']} acerto(s)")
-            if trial["days_left"] is not None: parts.append(f"{trial['days_left']} dia(s)")
-            if trial["uses_left"] is not None: parts.append(f"{trial['uses_left']} análise(s)")
+            if trial["hits_left"] is not None:
+                parts.append(f"{trial['hits_left']} acerto(s)")
+            if trial["days_left"] is not None:
+                parts.append(f"{trial['days_left']} dia(s)")
+            if trial["uses_left"] is not None:
+                parts.append(f"{trial['uses_left']} análise(s)")
             saldo = " • ".join(parts) if parts else "ativo"
-            trial_line = f"
-🆓 <b>Teste</b>: {saldo} restante(s)."
+            trial_line = "\n🆓 <b>Teste</b>: " + saldo + " restante(s)."
         else:
-            trial_line = "
-🆓 <b>Teste</b>: encerrado. Use /assinar para continuar."
+            trial_line = "\n🆓 <b>Teste</b>: encerrado. Use /assinar para continuar."
+
     html = (
-        "🤖 <b>Analista de Dúzias</b>
-"
-        f"Seu ID: <code>{uid}</code>
-"
-        f"{trial_line}
-
-"
-        "Envie números (ex.: <code>32 19 33 12 8</code>). Padrão: <b>2 dúzias</b>.
-
-"
-        "Comandos:
-"
-        "• <code>/mode 1</code> — 1 dúzia | <code>/mode 2</code> — 2 dúzias
-"
-        "• <code>/k 5</code> — janela recente (K)
-"
-        "• <code>/n 80</code> — tamanho do histórico (N)
-"
-        "• <code>/stats</code> — seus acertos | <code>/resetstats</code> — zerar
-"
-        "• <code>/assinar</code> — pagar | <code>/status</code> — validade
-"
-        "• <code>/reset</code> — limpar histórico
-
-"
+        "🤖 <b>Analista de Dúzias</b>\n"
+        f"Seu ID: <code>{uid}</code>\n"
+        + trial_line + "\n\n"
+        "Envie números (ex.: <code>32 19 33 12 8</code>). Padrão: <b>2 dúzias</b>.\n\n"
+        "Comandos:\n"
+        "• <code>/mode 1</code> — 1 dúzia | <code>/mode 2</code> — 2 dúzias\n"
+        "• <code>/k 5</code> — janela recente (K)\n"
+        "• <code>/n 80</code> — tamanho do histórico (N)\n"
+        "• <code>/stats</code> — seus acertos | <code>/resetstats</code> — zerar\n"
+        "• <code>/assinar</code> — pagar | <code>/status</code> — validade\n"
+        "• <code>/reset</code> — limpar histórico\n\n"
         "💡 Para melhor apuração de acertos, envie <b>um número por mensagem</b>."
     )
     await send_html(update, html)
