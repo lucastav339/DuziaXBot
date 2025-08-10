@@ -4,6 +4,8 @@ import datetime
 import logging
 from dotenv import load_dotenv
 
+from html import escape as esc  # <<< evita erros de HTML no Telegram
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -45,7 +47,7 @@ MIN_GAP2 = int(os.getenv("MIN_GAP2", "1"))                # vantagem mínima ent
 COOLDOWN_MISSES = int(os.getenv("COOLDOWN_MISSES", "2"))  # “freio” após erros seguidos
 GAP_BONUS_ON_COOLDOWN = int(os.getenv("GAP_BONUS_ON_COOLDOWN", "1"))
 
-APP_VERSION = "unificado-v1.5-trial-hits-conservador-creativo"
+APP_VERSION = "unificado-v1.5-trial-hits-conservador-creativo-esc"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -370,7 +372,7 @@ async def send_html(update: Update, html: str):
 # HANDLERS DE COMANDO
 # =========================
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_html(update, f"<b>Versão</b>: <code>{APP_VERSION}</code>")
+    await send_html(update, f"<b>Versão</b>: <code>{esc(APP_VERSION)}</code>")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
@@ -394,14 +396,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if trial["uses_left"] is not None:
                 parts.append(f"{trial['uses_left']} análise(s)")
             saldo = " • ".join(parts) if parts else "ativo"
-            trial_line = "\n🆓 <b>Teste</b>: " + saldo + " restante(s)."
+            trial_line = "\n🆓 <b>Teste</b>: " + esc(saldo) + " restante(s)."
         else:
             trial_line = "\n🆓 <b>Teste</b>: encerrado. Use /assinar para continuar."
 
     html = f"""🎩 <b>Bem-vindo ao Analista de Dúzias</b>
 <i>Seu assistente que observa o "ritmo" das dúzias e só sugere quando o cenário está a favor.</i>
 
-👤 ID: <code>{uid}</code>{trial_line}
+👤 ID: <code>{esc(str(uid))}</code>{trial_line}
 
 🧠 <b>Como funciona</b>
 • Lemos os últimos resultados que você enviar.
@@ -420,7 +422,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • <code>/assinar</code> — pagar            |   <code>/status</code> — ver validade
 • <code>/reset</code> — limpar histórico
 
-💡 Dica: consistência > pressa. Se não houver vantagem estatística, não forçamos a jogada."""
+💡 Dica: consistência &gt; pressa. Se não houver vantagem estatística, não forçamos a jogada."""
     await send_html(update, html)
 
 async def cmd_assinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,7 +430,7 @@ async def cmd_assinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     html = f"""💳 <b>Assinatura</b>
 Acesso por {SUB_DAYS} dias.
 
-➡️ Pague aqui: <a href='{link}'>Finalizar pagamento</a>
+➡️ Pague aqui: <a href='{esc(link)}'>Finalizar pagamento</a>
 Assim que aprovado, liberamos automaticamente. Use /status para conferir."""
     await send_html(update, html)
 
@@ -450,7 +452,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if trial["uses_left"] is not None:
                 parts.append(f"{trial['uses_left']} análise(s)")
             saldo = " • ".join(parts) if parts else "ativo"
-            await send_html(update, f"🆓 <b>Em teste</b> — {saldo}.")
+            await send_html(update, f"🆓 <b>Em teste</b> — {esc(saldo)}.")
         else:
             await send_html(update, "🔴 <b>Inativo</b>. Seu período de teste encerrou. Use /assinar para continuar.")
     else:
@@ -471,7 +473,7 @@ async def require_active_or_trial(update: Update) -> bool:
 
     link = PAYMENT_LINK
     html = f"""🔒 <b>Seu teste terminou</b>.
-Para continuar por {SUB_DAYS} dias: <a href='{link}'>assine aqui</a>."""
+Para continuar por {SUB_DAYS} dias: <a href='{esc(link)}'>assine aqui</a>."""
     await send_html(update, html)
     return False
 
@@ -531,7 +533,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rem.append(f"{trial['days_left']} dia(s)")
             if trial["uses_left"] is not None:
                 rem.append(f"{trial['uses_left']} análise(s)")
-            tline = "\n🆓 Teste: " + (" • ".join(rem) if rem else "ativo")
+            tline = "\n🆓 Teste: " + esc(" • ".join(rem) if rem else "ativo")
         else:
             tline = "\n🆓 Teste: encerrado"
 
@@ -586,7 +588,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if hit_limit_now and not PAYWALL_OFF:
         link = PAYMENT_LINK
         html = f"""🆓 <b>Período de teste encerrado</b> — você atingiu o limite de <b>{TRIAL_MAX_HITS} acertos</b>.
-Para continuar por {SUB_DAYS} dias: <a href='{link}'>assine aqui</a>."""
+Para continuar por {SUB_DAYS} dias: <a href='{esc(link)}'>assine aqui</a>."""
         await send_html(update, html)
         return
 
@@ -617,13 +619,13 @@ Para continuar por {SUB_DAYS} dias: <a href='{link}'>assine aqui</a>."""
         if trial.get("uses_left") is not None:
             parts.append(f"{trial['uses_left']} análise(s)")
         if parts:
-            trial_footer = "\n🆓 Teste: " + " • ".join(parts) + " restante(s)."
+            trial_footer = "\n🆓 Teste: " + esc(" • ".join(parts)) + " restante(s)."
 
     if st["modo"] == 1:
         ok, duzia, dbg, motivo = escolher_1_duzia_conservador(st["hist"], K, s)
         if not ok:
             html = f"""⏸️ <b>Sem aposta agora</b>
-Motivo: {motivo}
+Motivo: {esc(motivo)}
 🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
 📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
 🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
@@ -644,7 +646,7 @@ Motivo: {motivo}
         ok, duzias, excl, dbg, motivo = escolher_2_duzias_conservador(st["hist"], K, s)
         if not ok:
             html = f"""⏸️ <b>Sem aposta agora</b>
-Motivo: {motivo}
+Motivo: {esc(motivo)}
 🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
 📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
 🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
