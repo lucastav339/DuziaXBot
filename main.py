@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-import datetime  # <- manter este import (não use "from datetime import ...")
+import datetime  # manter este import (não use "from datetime import ...")
 import logging
 from html import escape as esc
 
@@ -22,31 +22,31 @@ from telegram.error import BadRequest
 # =========================
 # CONFIG / ENV
 # =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").rstrip("/")
-TG_PATH = os.getenv("TG_PATH", "tg")
-REDIS_URL = os.getenv("REDIS_URL", "")
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
+TG_PATH = (os.getenv("TG_PATH", "tg") or "tg").strip()
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
 
-TRIAL_MAX_HITS = int(os.getenv("TRIAL_MAX_HITS", "10"))
-SUB_DAYS = int(os.getenv("SUB_DAYS", "7"))
-PAYWALL_OFF = os.getenv("PAYWALL_OFF", "0") == "1"
+TRIAL_MAX_HITS = int((os.getenv("TRIAL_MAX_HITS") or "10").strip())
+SUB_DAYS = int((os.getenv("SUB_DAYS") or "7").strip())
+PAYWALL_OFF = ((os.getenv("PAYWALL_OFF") or "0").strip() == "1")
 
 # Estratégia conservadora (parâmetros)
-CONFIRM_REC = int(os.getenv("CONFIRM_REC", "6"))          # janela curtíssima para confirmar
-REQUIRE_STREAK1 = int(os.getenv("REQUIRE_STREAK1", "2"))  # ocorrências mínimas da líder na curtíssima
-MIN_GAP1 = int(os.getenv("MIN_GAP1", "2"))                # gap mínimo (líder - 2ª) para 1 dúzia
-MIN_GAP2 = int(os.getenv("MIN_GAP2", "1"))                # gap mínimo (2ª - 3ª) para 2 dúzias
-COOLDOWN_MISSES = int(os.getenv("COOLDOWN_MISSES", "2"))  # freio após erros seguidos
-GAP_BONUS_ON_COOLDOWN = int(os.getenv("GAP_BONUS_ON_COOLDOWN", "1"))
+CONFIRM_REC = int((os.getenv("CONFIRM_REC") or "6").strip())          # janela curtíssima
+REQUIRE_STREAK1 = int((os.getenv("REQUIRE_STREAK1") or "2").strip())  # ocorrências mínimas na curtíssima
+MIN_GAP1 = int((os.getenv("MIN_GAP1") or "2").strip())                # gap mínimo (líder - 2ª) p/ 1 dúzia
+MIN_GAP2 = int((os.getenv("MIN_GAP2") or "1").strip())                # gap mínimo (2ª - 3ª) p/ 2 dúzias
+COOLDOWN_MISSES = int((os.getenv("COOLDOWN_MISSES") or "2").strip())  # freio após erros seguidos
+GAP_BONUS_ON_COOLDOWN = int((os.getenv("GAP_BONUS_ON_COOLDOWN") or "1").strip())
 
-PAYMENT_LINK = "https://mpago.li/1cHXVHc"
+PAYMENT_LINK = (os.getenv("PAYMENT_LINK") or "https://mpago.li/1cHXVHc").strip()
 
 # Limites de entrada/antiflood
-MAX_NUMS_PER_MSG = int(os.getenv("MAX_NUMS_PER_MSG", "40"))   # corta exageros por mensagem
-CHUNK = int(os.getenv("CHUNK", "12"))                          # processa em blocos para não travar
-MIN_GAP_SECONDS = float(os.getenv("MIN_GAP_SECONDS", "0.35"))  # antiflood por usuário
+MAX_NUMS_PER_MSG = int((os.getenv("MAX_NUMS_PER_MSG") or "40").strip())   # corta exageros por mensagem
+CHUNK = int((os.getenv("CHUNK") or "12").strip())                          # processa em blocos para não travar
+MIN_GAP_SECONDS = float((os.getenv("MIN_GAP_SECONDS") or "0.35").strip())  # antiflood por usuário
 
-APP_VERSION = "unificado-v2.1-conservador-just-formal-datetimefix"
+APP_VERSION = "unificado-v2.2-IA-estrategica"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("main")
@@ -81,7 +81,7 @@ STATE = {}  # uid -> {modo,K,N,hist,pred_queue,stats,last_touch}
 def ensure_user(uid: int):
     if uid not in STATE:
         STATE[uid] = {
-            "modo": 2,  # 1 dúzia = 1 | 2 dúzias = 2 (padrão conservador usa 2)
+            "modo": 2,  # padrão: 2 dúzias (conservador)
             "K": 5,
             "N": 80,
             "hist": [],
@@ -91,7 +91,7 @@ def ensure_user(uid: int):
         }
 
 # =========================
-# UTIL
+# UTIL + ENVIO
 # =========================
 TELEGRAM_LIMIT = 4096
 def fit_telegram(html: str) -> str:
@@ -129,6 +129,72 @@ def _contagens_duzias(nums):
         d = get_duzia(n)
         if d: c[d] += 1
     return c
+
+# =========================
+# FORMATAÇÃO "IA ESTRATÉGICA"
+# =========================
+def fmt_start(uid: int, hits_left: int, trial_max: int) -> str:
+    return f"""
+🤖 <b>IA Estratégica — Analista de Dúzias</b>
+━━━━━━━━━━━━━━━━━━
+🆔 <b>ID:</b> <code>{esc(str(uid))}</code>
+🆓 <b>Teste:</b> {hits_left} / {trial_max} acertos restantes
+━━━━━━━━━━━━━━━━━━
+📌 <b>Comandos</b>:
+<code>/mode 1</code> — 1 dúzia   •   <code>/mode 2</code> — 2 dúzias
+<code>/k 5</code> — janela recente (K)   •   <code>/n 80</code> — histórico (N)
+<code>/stats</code> — estatísticas   •   <code>/reset</code> — limpar histórico
+<code>/assinar</code> — pagar   •   <code>/status</code> — validade
+━━━━━━━━━━━━━━━━━━
+💡 <i>Dica:</i> Envie um número por mensagem para apuração de acertos precisa.
+""".strip()
+
+def fmt_paywall(link: str, days: int) -> str:
+    return f"""
+💳 <b>Seu teste grátis terminou</b>
+━━━━━━━━━━━━━━━━━━
+Para continuar usando o <b>Analista de Dúzias</b> por <b>{days} dias</b>:
+✅ Acesso ilimitado
+✅ Estratégia conservadora validada
+✅ Justificativas técnicas detalhadas
+
+➡️ <a href="{esc(link)}">Clique aqui para pagar</a>
+""".strip()
+
+def fmt_recommendation(duzias: list[str], excl: str | None, justificativa: str,
+                       pendentes: int, hits_left: int, trial_max: int) -> str:
+    dz = " + ".join(f"<b>{d}</b>" for d in duzias)
+    excl_txt = f"   → 🚫 Exclusão estratégica: <b>{excl}</b>\n" if excl else ""
+    return f"""
+🤖 <b>IA Estratégica — Análise Concluída</b>
+━━━━━━━━━━━━━━━━━━
+📡 <b>Varredura do histórico concluída</b>
+📊 <b>Sugestão de entrada</b>:
+   → 🎯 Recomendação: {dz}
+{excl_txt}
+🧠 <b>Raciocínio da IA</b>:
+{esc(justificativa)}
+
+📌 <b>Status da execução</b>: {pendentes} jogada(s) pendente(s)
+🆓 <b>Modo teste</b>: {hits_left}/{trial_max} acertos restantes
+━━━━━━━━━━━━━━━━━━
+""".strip()
+
+def fmt_no_recommendation(motivo: str, justificativa: str,
+                          hits_left: int, trial_max: int) -> str:
+    return f"""
+🤖 <b>IA Estratégica — Monitoramento Ativo</b>
+━━━━━━━━━━━━━━━━━━
+📡 <b>Varredura do histórico concluída</b>
+⚠️ <b>Nenhuma configuração de vantagem detectada</b>
+
+📎 <b>Motivo técnico</b>: {esc(motivo)}
+🧠 <b>Raciocínio da IA</b>:
+{esc(justificativa)}
+
+🆓 <b>Modo teste</b>: {hits_left}/{trial_max} acertos restantes
+━━━━━━━━━━━━━━━━━━
+""".strip()
 
 # =========================
 # TRIAL / PAYWALL
@@ -174,11 +240,7 @@ async def require_active_or_trial(update: Update) -> bool:
     if hits < TRIAL_MAX_HITS:
         return True
     # bloqueia
-    html = (
-        "🔒 <b>Seu período de teste terminou</b>.\n"
-        f"Para continuar por {SUB_DAYS} dias: <a href='{esc(PAYMENT_LINK)}'>assine aqui</a>."
-    )
-    await send_html(update, html)
+    await send_html(update, fmt_paywall(PAYMENT_LINK, SUB_DAYS))
     return False
 
 # =========================
@@ -260,31 +322,31 @@ def just_apostar_2(dbg):
 
 def just_aguardar_1(dbg, motivo):
     gap = dbg.get("gap", "?"); min_gap = dbg.get("min_gap", "?"); d = dbg.get("top", "")
-    base = "A recomendação foi vetada por insuficiência de evidência robusta no curto prazo. "
+    base = "A recomendação foi postergada por insuficiência de evidência robusta no curto prazo. "
     if "Confirmação" in motivo or "curta" in motivo:
         return base + (
             f"A {d} não alcançou o mínimo de ocorrências exigido na janela curtíssima, "
-            f"o que impede caracterizar uma tendência confiável no momento."
+            f"impedindo caracterização de tendência confiável no momento."
         )
     if "Gap" in motivo or "gap" in motivo:
         return base + (
             f"A separação entre a líder e a segunda colocada é inferior ao limiar (gap={gap} < {min_gap}), "
-            f"caracterizando equilíbrio técnico e risco elevado de reversão."
+            f"indicando equilíbrio técnico e risco de reversão."
         )
-    return base + "O cenário indica distribuição mais uniforme entre as dúzias, recomendando observação adicional."
+    return base + "O cenário permanece difuso entre as dúzias, recomendando observação adicional."
 
 def just_aguardar_2(dbg, motivo):
     gap23 = dbg.get("gap23", "?"); min_gap2 = dbg.get("min_gap2", "?"); excl = dbg.get("excl", "D?")
-    base = "Sinal postergado por ausência de dominância estatística suficiente entre as três dúzias. "
+    base = "Sinal contido por ausência de dominância estatística suficiente entre as três dúzias. "
     if "presença" in motivo or "mínima" in motivo:
         return base + (
             "A janela curtíssima não registrou presença suficiente nas candidatas, "
-            "o que reduz a confiabilidade de continuidade no próximo giro."
+            "reduzindo a confiabilidade de continuidade no próximo giro."
         )
     if "gap23" in motivo or "Gap23" in motivo or "Gap" in motivo:
         return base + (
-            f"A diferença entre a 2ª e a 3ª colocada não atingiu o limiar (gap23={gap23} < {min_gap2}), "
-            f"indicando instabilidade e risco de alternância."
+            f"A diferença entre a 2ª e a 3ª não atingiu o limiar (gap23={gap23} < {min_gap2}), "
+            f"sugerindo instabilidade de padrão."
         )
     return base + f"No momento, a dúzia excluída ({excl}) não se distancia o suficiente das selecionadas."
 
@@ -323,42 +385,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     hits = await get_trial_hits(uid) if rds else 0
     hits_left = max(TRIAL_MAX_HITS - hits, 0)
-    html = (
-        f"🎩 <b>Analista de Dúzias</b>\n"
-        f"<i>Modo conservador ativo. Recomendo somente quando a vantagem técnica está presente.</i>\n\n"
-        f"👤 ID: <code>{esc(str(uid))}</code>\n"
-        f"🆓 Teste grátis: <b>{hits_left}</b> acerto(s) restante(s) de {TRIAL_MAX_HITS}.\n\n"
-        "Envie os números conforme forem saindo (ex.: <code>32 19 33 12 8</code>). "
-        "Para melhor apuração de acertos, prefira enviar <b>um número por mensagem</b>."
-        "\n\nComandos:\n"
-        "• <code>/mode 1</code> — 1 dúzia | <code>/mode 2</code> — 2 dúzias\n"
-        "• <code>/k 5</code> — janela recente | <code>/n 80</code> — histórico\n"
-        "• <code>/stats</code> — seus acertos | <code>/reset</code> — limpar histórico\n"
-        "• <code>/assinar</code> — pagar | <code>/status</code> — ver validade"
-    )
-    await send_html(update, html)
+    await send_html(update, fmt_start(uid, hits_left, TRIAL_MAX_HITS))
 
 async def cmd_assinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    html = (
-        f"💳 <b>Assinatura</b>\n"
-        f"Acesso por {SUB_DAYS} dias.\n\n"
-        f"➡️ <a href='{esc(PAYMENT_LINK)}'>Finalizar pagamento</a>\n"
-        f"Após aprovado, o acesso é liberado automaticamente."
-    )
-    await send_html(update, html)
+    await send_html(update, fmt_paywall(PAYMENT_LINK, SUB_DAYS))
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@status")
     if paid and paid >= today():
-        await send_html(update, f"🟢 <b>Ativo</b> até <b>{paid.strftime('%d/%m/%Y')}</b>.")
+        html = f"""
+🤖 <b>IA Estratégica — Status</b>
+━━━━━━━━━━━━━━━━━━
+🟢 <b>Acesso ativo</b> até <b>{paid.strftime('%d/%m/%Y')}</b>.
+""".strip()
+        await send_html(update, html)
         return
     hits = await get_trial_hits(uid)
     hits_left = max(TRIAL_MAX_HITS - (hits or 0), 0)
-    if hits_left > 0:
-        await send_html(update, f"🆓 <b>Em teste</b> — {hits_left} acerto(s) restante(s).")
-    else:
-        await send_html(update, "🔴 <b>Inativo</b>. Seu teste terminou. Use /assinar para continuar.")
+    html = f"""
+🤖 <b>IA Estratégica — Status</b>
+━━━━━━━━━━━━━━━━━━
+🆓 <b>Em teste</b> — {hits_left} / {TRIAL_MAX_HITS} acertos restantes.
+""".strip()
+    await send_html(update, html)
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_active_or_trial(update): return
@@ -396,7 +446,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = STATE[update.effective_user.id]["stats"]
     p = len(STATE[update.effective_user.id]["pred_queue"])
     html = (
-        "📈 <b>Resultados</b>\n"
+        "📈 <b>IA Estratégica — Resultados</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         f"• ✅ Acertos: <b>{s['hits']}</b>\n"
         f"• ❌ Erros: <b>{s['misses']}</b>\n"
         f"• 🎯 Taxa: <b>{pct(s['hits'], s['misses'])}%</b>\n"
@@ -433,11 +484,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hit_limit_now = True
         await asyncio.sleep(0.05)
     if hit_limit_now and not PAYWALL_OFF:
-        html = (
-            f"🆓 <b>Período de teste encerrado</b> — limite de <b>{TRIAL_MAX_HITS}</b> acertos atingido.\n"
-            f"Para continuar por {SUB_DAYS} dias: <a href='{esc(PAYMENT_LINK)}'>assine aqui</a>."
-        )
-        await send_html(update, html)
+        await send_html(update, fmt_paywall(PAYMENT_LINK, SUB_DAYS))
         return
 
     # 2) Paywall/trial
@@ -459,12 +506,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not ok:
             jus = just_aguardar_1(dbg, motivo)
-            html = (
-                "⏸️ <b>Sem entrada agora</b>\n"
-                f"📊 <b>Motivo técnico:</b> {esc(motivo)}\n"
-                f"📖 <b>Justificativa:</b> {esc(jus)}\n"
-                f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
-            )
+            html = fmt_no_recommendation(motivo, jus, hits_left, TRIAL_MAX_HITS)
             await send_html(update, html)
             return
 
@@ -472,12 +514,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["pred_queue"].append({"modo": 1, "duzias": [duzia]})
         pend = len(st["pred_queue"])
         jus = just_apostar_1(dbg)
-        html = (
-            f"🎯 <b>Recomendação:</b> Apostar em <b>{duzia}</b>\n"
-            f"📖 <b>Justificativa técnica:</b> {esc(jus)}\n"
-            f"🔁 Pendentes: <b>{pend}</b>\n"
-            f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
-        )
+        html = fmt_recommendation([duzia], None, jus, pend, hits_left, TRIAL_MAX_HITS)
         await send_html(update, html)
 
     else:
@@ -487,24 +524,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not ok:
             jus = just_aguardar_2(dbg, motivo)
-            html = (
-                "⏸️ <b>Sem entrada agora</b>\n"
-                f"📊 <b>Motivo técnico:</b> {esc(motivo)}\n"
-                f"📖 <b>Justificativa:</b> {esc(jus)}\n"
-                f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
-            )
+            html = fmt_no_recommendation(motivo, jus, hits_left, TRIAL_MAX_HITS)
             await send_html(update, html)
             return
 
         st["pred_queue"].append({"modo": 2, "duzias": duzias})
         pend = len(st["pred_queue"])
         jus = just_apostar_2(dbg)
-        html = (
-            f"🎯 <b>Recomendação:</b> Apostar em <b>{duzias[0]}</b> + <b>{duzias[1]}</b>  |  🚫 Excluída: <b>{excl}</b>\n"
-            f"📖 <b>Justificativa técnica:</b> {esc(jus)}\n"
-            f"🔁 Pendentes: <b>{pend}</b>\n"
-            f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
-        )
+        html = fmt_recommendation(duzias, excl, jus, pend, hits_left, TRIAL_MAX_HITS)
         await send_html(update, html)
 
 # =========================
@@ -555,12 +582,15 @@ aio.router.add_get("/health", health_handler)
 aio.router.add_get("/", root_handler)
 
 async def on_startup(app: web.Application):
+    if (not TELEGRAM_TOKEN) or ("\n" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
+        raise RuntimeError("TELEGRAM_TOKEN inválido (vazio, com espaço ou quebra de linha). Corrija nas Environment Variables.")
     print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS}")
     await application.initialize()
     await application.start()
     if PUBLIC_URL:
-        await application.bot.set_webhook(url=f"{PUBLIC_URL}/{TG_PATH}", drop_pending_updates=True)
-        print("✅ Webhook setado.")
+        hook_url = f"{PUBLIC_URL}/{TG_PATH}"
+        await application.bot.set_webhook(url=hook_url, drop_pending_updates=True)
+        print(f"✅ Webhook setado em {hook_url}")
     else:
         print("⚠️ Defina PUBLIC_URL para habilitar o webhook.")
 
