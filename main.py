@@ -463,7 +463,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⏸️ <b>Sem entrada agora</b>\n"
                 f"📊 <b>Motivo técnico:</b> {esc(motivo)}\n"
                 f"📖 <b>Justificativa:</b> {esc(jus)}\n"
-                f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+                f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
             )
             await send_html(update, html)
             return
@@ -476,7 +476,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎯 <b>Recomendação:</b> Apostar em <b>{duzia}</b>\n"
             f"📖 <b>Justificativa técnica:</b> {esc(jus)}\n"
             f"🔁 Pendentes: <b>{pend}</b>\n"
-            f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+            f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
         )
         await send_html(update, html)
 
@@ -491,7 +491,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⏸️ <b>Sem entrada agora</b>\n"
                 f"📊 <b>Motivo técnico:</b> {esc(motivo)}\n"
                 f"📖 <b>Justificativa:</b> {esc(jus)}\n"
-                f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+                f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
             )
             await send_html(update, html)
             return
@@ -503,7 +503,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎯 <b>Recomendação:</b> Apostar em <b>{duzias[0]}</b> + <b>{duzias[1]}</b>  |  🚫 Excluída: <b>{excl}</b>\n"
             f"📖 <b>Justificativa técnica:</b> {esc(jus)}\n"
             f"🔁 Pendentes: <b>{pend}</b>\n"
-            f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+            f"🆓 Teste Grátis: {hits_left} acerto(s) restante(s)."
         )
         await send_html(update, html)
 
