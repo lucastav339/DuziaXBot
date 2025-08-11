@@ -835,6 +835,13 @@ aio.router.add_post(f"/{TG_PATH}", tg_handler)
 aio.router.add_post("/payments/webhook", payments_handler)
 aio.router.add_get("/health", health_handler)
 
+# ⇩ NOVO: responder 200 no root para o health check padrão do Render
+async def root_handler(request):
+    return web.Response(text="ok")
+
+aio.router.add_get("/", root_handler)
+aio.router.add_head("/", root_handler)
+
 async def on_startup(app: web.Application):
     print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS} | PAYWALL_OFF={PAYWALL_OFF} | JUSTIFY_ON={JUSTIFY_ON}")
     if not TOKEN:
