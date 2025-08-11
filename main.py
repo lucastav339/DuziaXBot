@@ -4,7 +4,7 @@ import datetime
 import logging
 from dotenv import load_dotenv
 
-from html import escape as esc  # <<< evita erros de HTML no Telegram
+from html import escape as esc  # evita erros de HTML no Telegram
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -47,7 +47,10 @@ MIN_GAP2 = int(os.getenv("MIN_GAP2", "1"))                # vantagem mínima ent
 COOLDOWN_MISSES = int(os.getenv("COOLDOWN_MISSES", "2"))  # “freio” após erros seguidos
 GAP_BONUS_ON_COOLDOWN = int(os.getenv("GAP_BONUS_ON_COOLDOWN", "1"))
 
-APP_VERSION = "unificado-v1.5-trial-hits-conservador-creativo-esc"
+# Justificativas
+JUSTIFY_ON = os.getenv("JUSTIFY_ON", "1") == "1"          # 1=exibir justificativas; 0=ocultar
+
+APP_VERSION = "unificado-v1.6-trial-hits-conservador-creativo-esc-just"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -188,6 +191,73 @@ def escolher_2_duzias_conservador(hist, K, stats):
         return (False, [], excl, dbg, f"Vantagem insuficiente (gap23={gap23} < {min_gap2})")
 
     return (True, [d1, d2], excl, dbg, "Sinal confirmado")
+
+# =========================
+# JUSTIFICATIVAS (SEM CITAÇÕES)
+# =========================
+def pick_justification(mode: int, ok: bool, dbg: dict, motivo: str | None) -> str:
+    """
+    Retorna uma justificativa curta e coerente com a decisão tomada.
+    Sem referências externas; linguagem neutra e conservadora.
+    """
+    lines = []
+
+    if ok:
+        # Entrou
+        if mode == 1:
+            gap = dbg.get("gap", "?")
+            min_gap = dbg.get("min_gap", "?")
+            confirm_ok = dbg.get("confirm_ok", False)
+            if confirm_ok and isinstance(gap, int) and isinstance(min_gap, int) and gap >= min_gap:
+                lines.append("Frequência recente da líder acima do mínimo e confirmada na janela curta.")
+                lines.append(f"Separação suficiente entre líder e segunda colocada (gap {gap} ≥ {min_gap}).")
+            elif confirm_ok:
+                lines.append("Confirmação recente atingida; vantagem moderada favorece a líder.")
+            else:
+                lines.append("Tendência consistente favorecendo a líder na janela recente.")
+        else:
+            # mode 2
+            gap23 = dbg.get("gap23", "?")
+            min_gap2 = dbg.get("min_gap2", "?")
+            excl = dbg.get("excl", "—")
+            confirm_ok = dbg.get("confirm_ok", False)
+            if confirm_ok and isinstance(gap23, int) and isinstance(min_gap2, int) and gap23 >= min_gap2:
+                lines.append("Duas dúzias mostram dominância frente à terceira.")
+                lines.append(f"Separação entre 2ª e 3ª atende ao mínimo (gap {gap23} ≥ {min_gap2}).")
+                lines.append(f"Dúzia excluída no momento: {excl}.")
+            elif confirm_ok:
+                lines.append("Pelo menos uma das escolhidas teve presença recente; combinação favorecida.")
+            else:
+                lines.append("Conjunto de duas dúzias com melhor comportamento relativo na janela recente.")
+    else:
+        # Não entrou (segurar)
+        m = (motivo or "").lower()
+
+        too_small_gap = ("gap=" in m) or ("vantagem insuficiente" in m) or ("gap23" in m)
+        no_confirm = ("sem confirmação" in m) or (dbg.get("confirm_ok") is False)
+        balanced = False
+
+        if mode == 1:
+            g = dbg.get("gap")
+            balanced = (isinstance(g, int) and g == 0)
+        else:
+            g23 = dbg.get("gap23")
+            balanced = (isinstance(g23, int) and g23 == 0)
+
+        if no_confirm:
+            lines.append("Confirmação recente insuficiente; melhor aguardar mais ocorrências.")
+        if too_small_gap:
+            if mode == 1:
+                lines.append("Separação entre líder e segunda colocada abaixo do mínimo exigido.")
+            else:
+                lines.append("Diferença entre 2ª e 3ª colocada abaixo do limiar de segurança.")
+        if balanced:
+            lines.append("Distribuição recente muito equilibrada; sem dominância clara.")
+
+        if not lines:
+            lines.append("Cenário ainda instável; aguardando evidências mais consistentes.")
+
+    return "• " + "\n• ".join(esc(s) for s in lines)
 
 # =========================
 # REDIS HELPERS (PAYWALL/TRIAL)
@@ -574,7 +644,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip().lower()
     if txt in ["/start", "/assinar", "/status", "/version"]:
-        # Esses comandos são tratados pelos respectivos handlers
         return
 
     ensure_user(update.effective_user.id)
@@ -629,6 +698,8 @@ Motivo: {esc(motivo)}
 🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
 📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
 🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
+            if JUSTIFY_ON:
+                html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(1, ok=False, dbg=dbg, motivo=motivo)}"
             await send_html(update, html)
             return
 
@@ -640,6 +711,8 @@ Motivo: {esc(motivo)}
 —
 ✅ <b>Acertos</b>: <b>{s['hits']}</b> / <b>{s['hits']+s['misses']}</b> (<b>{pct(s['hits'], s['misses'])}%</b>)  |  🔁 Pendentes: <b>{pend}</b>
 🔥 <b>Streak</b>: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
+        if JUSTIFY_ON:
+            html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(1, ok=True, dbg=dbg, motivo=None)}"
         await send_html(update, html)
 
     else:
@@ -650,6 +723,8 @@ Motivo: {esc(motivo)}
 🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
 📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
 🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
+            if JUSTIFY_ON:
+                html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(2, ok=False, dbg=dbg, motivo=motivo)}"
             await send_html(update, html)
             return
 
@@ -661,6 +736,8 @@ Motivo: {esc(motivo)}
 —
 ✅ <b>Acertos</b>: <b>{s['hits']}</b> / <b>{s['hits']+s['misses']}</b> (<b>{pct(s['hits'], s['misses'])}%</b>)  |  🔁 Pendentes: <b>{pend}</b>
 🔥 <b>Streak</b>: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
+        if JUSTIFY_ON:
+            html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(2, ok=True, dbg=dbg, motivo=None)}"
         await send_html(update, html)
 
 # =========================
@@ -712,7 +789,7 @@ aio.router.add_post("/payments/webhook", payments_handler)
 aio.router.add_get("/health", health_handler)
 
 async def on_startup(app: web.Application):
-    print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS} | PAYWALL_OFF={PAYWALL_OFF}")
+    print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS} | PAYWALL_OFF={PAYWALL_OFF} | JUSTIFY_ON={JUSTIFY_ON}")
     if not TOKEN:
         raise RuntimeError("Defina TELEGRAM_TOKEN")
     await application.initialize()
