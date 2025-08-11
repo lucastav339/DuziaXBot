@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-import datetime
+import datetime  # <- manter este import (não use "from datetime import ...")
 import logging
 from html import escape as esc
 
@@ -42,11 +42,11 @@ GAP_BONUS_ON_COOLDOWN = int(os.getenv("GAP_BONUS_ON_COOLDOWN", "1"))
 PAYMENT_LINK = "https://mpago.li/1cHXVHc"
 
 # Limites de entrada/antiflood
-MAX_NUMS_PER_MSG = int(os.getenv("MAX_NUMS_PER_MSG", "40"))
-CHUNK = int(os.getenv("CHUNK", "12"))
-MIN_GAP_SECONDS = float(os.getenv("MIN_GAP_SECONDS", "0.35"))
+MAX_NUMS_PER_MSG = int(os.getenv("MAX_NUMS_PER_MSG", "40"))   # corta exageros por mensagem
+CHUNK = int(os.getenv("CHUNK", "12"))                          # processa em blocos para não travar
+MIN_GAP_SECONDS = float(os.getenv("MIN_GAP_SECONDS", "0.35"))  # antiflood por usuário
 
-APP_VERSION = "unificado-v2.0-conservador-justificativas-formais"
+APP_VERSION = "unificado-v2.1-conservador-just-formal-datetimefix"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("main")
@@ -57,7 +57,13 @@ log = logging.getLogger("main")
 rds = None
 if REDIS_URL:
     try:
-        rds = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True, health_check_interval=30, socket_keepalive=True)
+        rds = redis.from_url(
+            REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
+            health_check_interval=30,
+            socket_keepalive=True
+        )
     except Exception as e:
         log.error(f"[BOOT] Falha ao inicializar Redis: {e}")
 
@@ -292,7 +298,7 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
     on_trial = (not PAYWALL_OFF) and (not paid) and rds
     hit_limit_now = False
 
-    # Consome os números na ordem de chegada (mais antigos primeiro)
+    # Consome os números na ordem de chegada
     for n in nums:
         d = get_duzia(n)
         if not d: continue
@@ -319,7 +325,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hits_left = max(TRIAL_MAX_HITS - hits, 0)
     html = (
         f"🎩 <b>Analista de Dúzias</b>\n"
-        f"<i>Modo conservador ativo. Eu só recomendo quando a vantagem técnica está presente.</i>\n\n"
+        f"<i>Modo conservador ativo. Recomendo somente quando a vantagem técnica está presente.</i>\n\n"
         f"👤 ID: <code>{esc(str(uid))}</code>\n"
         f"🆓 Teste grátis: <b>{hits_left}</b> acerto(s) restante(s) de {TRIAL_MAX_HITS}.\n\n"
         "Envie os números conforme forem saindo (ex.: <code>32 19 33 12 8</code>). "
@@ -405,7 +411,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
     uid = update.effective_user.id
 
-    # Anti-flood por usuário
+    # Anti-flood por usuário (usa datetime.datetime.utcnow())
     now = datetime.datetime.utcnow()
     last = STATE[uid]["last_touch"]
     if last and (now - last).total_seconds() < MIN_GAP_SECONDS:
