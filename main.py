@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import datetime
 import logging
 from dotenv import load_dotenv
@@ -50,7 +51,7 @@ GAP_BONUS_ON_COOLDOWN = int(os.getenv("GAP_BONUS_ON_COOLDOWN", "1"))
 # Justificativas
 JUSTIFY_ON = os.getenv("JUSTIFY_ON", "1") == "1"          # 1=exibir justificativas; 0=ocultar
 
-APP_VERSION = "unificado-v1.6-trial-hits-conservador-creativo-esc-just"
+APP_VERSION = "unificado-v1.7-stable-resilient-logs"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -260,8 +261,15 @@ def pick_justification(mode: int, ok: bool, dbg: dict, motivo: str | None) -> st
     return "• " + "\n• ".join(esc(s) for s in lines)
 
 # =========================
-# REDIS HELPERS (PAYWALL/TRIAL)
+# REDIS HELPERS + SAFE WRAPPER
 # =========================
+async def _safe_redis(coro, default=None, note=""):
+    try:
+        return await coro
+    except Exception as e:
+        logging.error(f"[REDIS-FAIL] {note}: {e}")
+        return default
+
 async def get_active_until(user_id: int):
     if not rds:
         return None
@@ -401,7 +409,7 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
     q = st["pred_queue"]
     stats = st["stats"]
 
-    paid = await get_active_until(uid)
+    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@score")
     on_trial = (not PAYWALL_OFF) and (not paid) and rds
     hit_limit_now = False
 
@@ -418,7 +426,7 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
             stats["streak_hit"] += 1
             stats["streak_miss"] = 0
             if on_trial and TRIAL_MAX_HITS > 0:
-                new_hits = await incr_trial_hits(uid, 1)
+                new_hits = await _safe_redis(incr_trial_hits(uid, 1), default=0, note="incr_trial_hits")
                 if new_hits >= TRIAL_MAX_HITS:
                     hit_limit_now = True
         else:
@@ -432,6 +440,8 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
 # MENSAGENS
 # =========================
 async def send_html(update: Update, html: str):
+    # pequeno debounce para evitar FloodWait
+    await asyncio.sleep(0.05)
     await update.message.reply_text(
         html,
         parse_mode=ParseMode.HTML,
@@ -450,20 +460,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # garante início de trial se não for pago
     if not PAYWALL_OFF and rds:
-        paid = await get_active_until(uid)
+        paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@start")
         if not paid:
-            await set_trial_start_if_absent(uid)
+            await _safe_redis(set_trial_start_if_absent(uid), default=None, note="trial_start@start")
 
-    trial = await get_trial_info(uid)
+    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="trial_info@start")
     trial_line = ""
-    if trial["enabled"]:
+    if trial.get("enabled"):
         if trial_allows(trial):
             parts = []
-            if trial["hits_left"] is not None:
+            if trial.get("hits_left") is not None:
                 parts.append(f"{trial['hits_left']} acerto(s)")
-            if trial["days_left"] is not None:
+            if trial.get("days_left") is not None:
                 parts.append(f"{trial['days_left']} dia(s)")
-            if trial["uses_left"] is not None:
+            if trial.get("uses_left") is not None:
                 parts.append(f"{trial['uses_left']} análise(s)")
             saldo = " • ".join(parts) if parts else "ativo"
             trial_line = "\n🆓 <b>Teste</b>: " + esc(saldo) + " restante(s)."
@@ -506,20 +516,20 @@ Assim que aprovado, liberamos automaticamente. Use /status para conferir."""
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    paid = await get_active_until(uid)
+    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@status")
     if paid and paid >= today():
         await send_html(update, f"🟢 <b>Ativo</b> até <b>{paid.strftime('%d/%m/%Y')}</b>.")
         return
 
-    trial = await get_trial_info(uid)
-    if trial["enabled"]:
+    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="trial_info@status")
+    if trial.get("enabled"):
         if trial_allows(trial):
             parts = []
-            if trial["hits_left"] is not None:
+            if trial.get("hits_left") is not None:
                 parts.append(f"{trial['hits_left']} acerto(s)")
-            if trial["days_left"] is not None:
+            if trial.get("days_left") is not None:
                 parts.append(f"{trial['days_left']} dia(s)")
-            if trial["uses_left"] is not None:
+            if trial.get("uses_left") is not None:
                 parts.append(f"{trial['uses_left']} análise(s)")
             saldo = " • ".join(parts) if parts else "ativo"
             await send_html(update, f"🆓 <b>Em teste</b> — {esc(saldo)}.")
@@ -533,11 +543,17 @@ async def require_active_or_trial(update: Update) -> bool:
         return True
 
     uid = update.effective_user.id
-    paid = await get_active_until(uid)
+    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@require")
+
+    # Se Redis indisponível, libera esta interação para não travar
+    if rds and paid is None:
+        logging.warning("[PAYWALL-SOFT] Redis indisponível; liberando esta mensagem.")
+        return True
+
     if paid and paid >= today():
         return True
 
-    trial = await get_trial_info(uid)
+    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="get_trial_info@require")
     if trial_allows(trial):
         return True
 
@@ -592,16 +608,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = STATE[update.effective_user.id]["stats"]
     p = len(STATE[update.effective_user.id]["pred_queue"])
 
-    trial = await get_trial_info(update.effective_user.id)
+    trial = await _safe_redis(get_trial_info(update.effective_user.id), default={"enabled": False}, note="trial_info@stats")
     tline = ""
-    if trial["enabled"]:
+    if trial.get("enabled"):
         if trial_allows(trial):
             rem = []
-            if trial["hits_left"] is not None:
+            if trial.get("hits_left") is not None:
                 rem.append(f"{trial['hits_left']} acerto(s)")
-            if trial["days_left"] is not None:
+            if trial.get("days_left") is not None:
                 rem.append(f"{trial['days_left']} dia(s)")
-            if trial["uses_left"] is not None:
+            if trial.get("uses_left") is not None:
                 rem.append(f"{trial['uses_left']} análise(s)")
             tline = "\n🆓 Teste: " + esc(" • ".join(rem) if rem else "ativo")
         else:
@@ -618,6 +634,26 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # DEBUG / ERROS
 # =========================
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    redis_ok = False
+    try:
+        if rds:
+            pong = await rds.ping()
+            redis_ok = bool(pong)
+    except Exception as e:
+        logging.error(f"[DIAG] Redis ping fail: {e}")
+    paid = await _safe_redis(get_active_until(uid), default=None, note="diag get_active_until")
+    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="diag get_trial_info")
+    st = STATE.get(uid, {})
+    html = f"""🛠️ <b>Diagnóstico</b>
+• Redis: <b>{"OK" if redis_ok else "OFF"}</b>
+• Pago até: <b>{paid.strftime('%d/%m/%Y') if paid else "—"}</b>
+• Trial: <b>{"on" if trial.get("enabled") else "off"}</b>
+• Modo: <b>{st.get('modo',"—")}</b> • K: <b>{st.get('K',"—")}</b> • N: <b>{st.get('N',"—")}</b>
+• Fila pendente: <b>{len(st.get('pred_queue',[]))}</b>"""
+    await send_html(update, html)
+
 async def debug_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if update and update.message:
@@ -642,8 +678,10 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # HANDLER PRINCIPAL DE TEXTO
 # =========================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"[FLOW] begin handle_text uid={update.effective_user.id} txt={update.message.text!r}")
+
     txt = (update.message.text or "").strip().lower()
-    if txt in ["/start", "/assinar", "/status", "/version"]:
+    if txt in ["/start", "/assinar", "/status", "/version", "/diag"]:
         return
 
     ensure_user(update.effective_user.id)
@@ -652,6 +690,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Primeiro valida previsões pendentes com os números enviados
     nums_now = [int(x) for x in re.findall(r"\d+", update.message.text or "")]
     hit_limit_now = await score_predictions(uid, nums_now)
+    logging.info(f"[FLOW] after score_predictions uid={uid} hit_limit_now={hit_limit_now}")
 
     # Se o trial estourou aqui, bloqueia e envia link
     if hit_limit_now and not PAYWALL_OFF:
@@ -661,9 +700,10 @@ Para continuar por {SUB_DAYS} dias: <a href='{esc(link)}'>assine aqui</a>."""
         await send_html(update, html)
         return
 
-    # Checa paywall/trial antes de processar nova recomendação
+    logging.info(f"[FLOW] before require_active_or_trial uid={uid}")
     if not await require_active_or_trial(update):
         return
+    logging.info(f"[FLOW] passed require_active_or_trial uid={uid}")
 
     if not nums_now:
         await send_html(update, "Envie números (ex.: <code>32 19 33 12 8</code>) ou <code>/start</code>.")
@@ -675,9 +715,11 @@ Para continuar por {SUB_DAYS} dias: <a href='{esc(link)}'>assine aqui</a>."""
     K = st["K"]
     N = len(st["hist"])
     s = st["stats"]
+    logging.info(f"[FLOW] computing recs uid={uid} mode={st['modo']} K={K} N={N}")
 
     # Info de trial para exibir “acertos restantes” no rodapé da resposta
-    trial = await get_trial_info(uid) if (rds and not PAYWALL_OFF and not await get_active_until(uid)) else {"enabled": False}
+    paid_now = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@reply")
+    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="trial_info@reply") if (rds and not PAYWALL_OFF and not paid_now) else {"enabled": False}
     trial_footer = ""
     if trial.get("enabled") and trial_allows(trial):
         parts = []
@@ -700,6 +742,7 @@ Motivo: {esc(motivo)}
 🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
             if JUSTIFY_ON:
                 html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(1, ok=False, dbg=dbg, motivo=motivo)}"
+            logging.info(f"[FLOW] sending reply uid={uid} mode=1 (NO-ENTRY)")
             await send_html(update, html)
             return
 
@@ -713,6 +756,7 @@ Motivo: {esc(motivo)}
 🔥 <b>Streak</b>: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
         if JUSTIFY_ON:
             html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(1, ok=True, dbg=dbg, motivo=None)}"
+        logging.info(f"[FLOW] sending reply uid={uid} mode=1 (ENTRY)")
         await send_html(update, html)
 
     else:
@@ -725,6 +769,7 @@ Motivo: {esc(motivo)}
 🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
             if JUSTIFY_ON:
                 html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(2, ok=False, dbg=dbg, motivo=motivo)}"
+            logging.info(f"[FLOW] sending reply uid={uid} mode=2 (NO-ENTRY)")
             await send_html(update, html)
             return
 
@@ -738,6 +783,7 @@ Motivo: {esc(motivo)}
 🔥 <b>Streak</b>: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
         if JUSTIFY_ON:
             html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(2, ok=True, dbg=dbg, motivo=None)}"
+        logging.info(f"[FLOW] sending reply uid={uid} mode=2 (ENTRY)")
         await send_html(update, html)
 
 # =========================
@@ -746,6 +792,7 @@ Motivo: {esc(motivo)}
 application = Application.builder().token(TOKEN).build()
 
 # Debug e erros
+application.add_handler(CommandHandler("diag", cmd_diag))
 application.add_handler(MessageHandler(filters.ALL, debug_tap), group=-1)
 application.add_error_handler(on_error)
 
@@ -777,7 +824,7 @@ async def payments_handler(request: web.Request):
     data = await request.json()
     if data.get("status") == "paid" and "user_id" in data:
         uid = int(data["user_id"])
-        dt = await set_active_days(uid, SUB_DAYS)
+        dt = await _safe_redis(set_active_days(uid, SUB_DAYS), default=None, note="payments set_active_days")
         return web.json_response({"ok": True, "active_until": dt.isoformat() if dt else None})
     return web.json_response({"ok": False})
 
