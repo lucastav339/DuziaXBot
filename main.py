@@ -3,9 +3,10 @@ import re
 import asyncio
 import datetime
 import logging
-from dotenv import load_dotenv
+from html import escape as esc
 
-from html import escape as esc  # evita erros de HTML no Telegram
+from aiohttp import web
+import redis.asyncio as redis
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -16,51 +17,93 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
-import redis.asyncio as redis
-from aiohttp import web
+from telegram.error import BadRequest
 
 # =========================
 # CONFIG / ENV
 # =========================
-load_dotenv()
-
-TOKEN = os.getenv("TELEGRAM_TOKEN")                   # obrigatório
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")  # ex.: https://seusite.onrender.com
-TG_PATH = os.getenv("TG_PATH", "tg")                  # caminho do webhook
-SUB_DAYS = int(os.getenv("SUB_DAYS", "7"))            # dias de acesso ao assinar
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").rstrip("/")
+TG_PATH = os.getenv("TG_PATH", "tg")
 REDIS_URL = os.getenv("REDIS_URL", "")
 
-# Trial: encerra ao atingir X acertos OU (opcional) por dias/uso
-TRIAL_MAX_HITS = int(os.getenv("TRIAL_MAX_HITS", "10"))   # limite de acertos no teste
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "0"))            # 0 = desliga por dias
-TRIAL_CAP  = int(os.getenv("TRIAL_CAP", "0"))             # 0 = sem limite por quantidade de análises
-PAYWALL_OFF = os.getenv("PAYWALL_OFF", "0") == "1"        # 1 = desliga paywall (modo debug)
+TRIAL_MAX_HITS = int(os.getenv("TRIAL_MAX_HITS", "10"))
+SUB_DAYS = int(os.getenv("SUB_DAYS", "7"))
+PAYWALL_OFF = os.getenv("PAYWALL_OFF", "0") == "1"
 
-# Link de pagamento
-PAYMENT_LINK = os.getenv("PAYMENT_LINK", "https://mpago.li/1cHXVHc")
-
-# Estratégia conservadora
-CONFIRM_REC = int(os.getenv("CONFIRM_REC", "6"))          # janela de confirmação curta
-REQUIRE_STREAK1 = int(os.getenv("REQUIRE_STREAK1", "2"))  # mínimo de ocorrências na confirmação curta
-MIN_GAP1 = int(os.getenv("MIN_GAP1", "2"))                # vantagem mínima p/ 1 dúzia
-MIN_GAP2 = int(os.getenv("MIN_GAP2", "1"))                # vantagem mínima entre 2ª e 3ª p/ 2 dúzias
-COOLDOWN_MISSES = int(os.getenv("COOLDOWN_MISSES", "2"))  # “freio” após erros seguidos
+# Estratégia conservadora (parâmetros)
+CONFIRM_REC = int(os.getenv("CONFIRM_REC", "6"))          # janela curtíssima para confirmar
+REQUIRE_STREAK1 = int(os.getenv("REQUIRE_STREAK1", "2"))  # ocorrências mínimas da líder na curtíssima
+MIN_GAP1 = int(os.getenv("MIN_GAP1", "2"))                # gap mínimo (líder - 2ª) para 1 dúzia
+MIN_GAP2 = int(os.getenv("MIN_GAP2", "1"))                # gap mínimo (2ª - 3ª) para 2 dúzias
+COOLDOWN_MISSES = int(os.getenv("COOLDOWN_MISSES", "2"))  # freio após erros seguidos
 GAP_BONUS_ON_COOLDOWN = int(os.getenv("GAP_BONUS_ON_COOLDOWN", "1"))
 
-# Justificativas
-JUSTIFY_ON = os.getenv("JUSTIFY_ON", "1") == "1"          # 1=exibir justificativas; 0=ocultar
+PAYMENT_LINK = "https://mpago.li/1cHXVHc"
 
-APP_VERSION = "unificado-v1.7-stable-resilient-logs"
+# Limites de entrada/antiflood
+MAX_NUMS_PER_MSG = int(os.getenv("MAX_NUMS_PER_MSG", "40"))
+CHUNK = int(os.getenv("CHUNK", "12"))
+MIN_GAP_SECONDS = float(os.getenv("MIN_GAP_SECONDS", "0.35"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s"
-)
+APP_VERSION = "unificado-v2.0-conservador-justificativas-formais"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+log = logging.getLogger("main")
+
+# =========================
+# REDIS
+# =========================
+rds = None
+if REDIS_URL:
+    try:
+        rds = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True, health_check_interval=30, socket_keepalive=True)
+    except Exception as e:
+        log.error(f"[BOOT] Falha ao inicializar Redis: {e}")
+
+async def _safe_redis(coro, default=None, note=""):
+    try:
+        return await coro
+    except Exception as e:
+        log.error(f"[REDIS-FAIL] {note}: {e}")
+        return default
+
+# =========================
+# ESTADO LOCAL
+# =========================
+STATE = {}  # uid -> {modo,K,N,hist,pred_queue,stats,last_touch}
+def ensure_user(uid: int):
+    if uid not in STATE:
+        STATE[uid] = {
+            "modo": 2,  # 1 dúzia = 1 | 2 dúzias = 2 (padrão conservador usa 2)
+            "K": 5,
+            "N": 80,
+            "hist": [],
+            "pred_queue": [],
+            "stats": {"hits": 0, "misses": 0, "streak_hit": 0, "streak_miss": 0},
+            "last_touch": None,
+        }
 
 # =========================
 # UTIL
 # =========================
+TELEGRAM_LIMIT = 4096
+def fit_telegram(html: str) -> str:
+    return html if len(html) <= TELEGRAM_LIMIT else html[:TELEGRAM_LIMIT-1] + "…"
+
+async def send_html(update: Update, html: str):
+    await asyncio.sleep(0.05)  # pequeno debounce anti-flood
+    try:
+        await update.message.reply_text(fit_telegram(html), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except BadRequest as e:
+        # Se alguma tag quebrou ou estourou, manda texto puro
+        log.error(f"[SEND_HTML] BadRequest: {e}. Enviando versão 'plain'.")
+        try:
+            plain = re.sub(r"<[^>]*>", "", html)
+            await update.message.reply_text(fit_telegram(plain))
+        except Exception as e2:
+            log.error(f"[SEND_HTML] Fallback falhou: {e2}")
+
 def today() -> datetime.date:
     return datetime.date.today()
 
@@ -69,449 +112,233 @@ def pct(h, m) -> float:
     return round((h * 100 / t), 1) if t else 0.0
 
 def get_duzia(n: int):
-    if 1 <= n <= 12:
-        return "D1"
-    if 13 <= n <= 24:
-        return "D2"
-    if 25 <= n <= 36:
-        return "D3"
+    if 1 <= n <= 12: return "D1"
+    if 13 <= n <= 24: return "D2"
+    if 25 <= n <= 36: return "D3"
     return None
 
 def _contagens_duzias(nums):
     c = {"D1": 0, "D2": 0, "D3": 0}
     for n in nums:
         d = get_duzia(n)
-        if d:
-            c[d] += 1
+        if d: c[d] += 1
     return c
 
 # =========================
-# MEMÓRIA / REDIS
+# TRIAL / PAYWALL
 # =========================
-rds = None
-if REDIS_URL:
+async def get_active_until(user_id: int):
+    if not rds: return None
     try:
-        rds = redis.from_url(
-            REDIS_URL,
-            encoding="utf-8",
-            decode_responses=True,
-            health_check_interval=30,
-            socket_keepalive=True
-        )
+        v = await rds.get(f"sub:{user_id}")
+        return datetime.date.fromisoformat(v) if v else None
     except Exception:
-        logging.exception("Falha ao inicializar Redis")
-        rds = None
+        return None
 
-# Memória por usuário (em RAM do processo)
-STATE = {}  # { uid: {"modo":2,"K":5,"N":80,"hist":[],"pred_queue":[],"stats":{...}} }
+async def set_active_days(user_id: int, days: int = SUB_DAYS):
+    if not rds: return None
+    dt = today() + datetime.timedelta(days=days)
+    await _safe_redis(rds.set(f"sub:{user_id}", dt.isoformat()), note="set_active_days")
+    return dt
 
-def ensure_user(uid: int):
-    if uid not in STATE:
-        STATE[uid] = {
-            "modo": 2,           # 1 = uma dúzia, 2 = duas dúzias
-            "K": 5,              # janela recente
-            "N": 80,             # tamanho do histórico em memória
-            "hist": [],
-            "pred_queue": [],    # fila de previsões pendentes de validação
-            "stats": {
-                "hits": 0,
-                "misses": 0,
-                "streak_hit": 0,
-                "streak_miss": 0
-            }
-        }
+async def get_trial_hits(user_id: int) -> int:
+    if not rds: return 0
+    v = await _safe_redis(rds.get(f"trial:hits:{user_id}"), default="0", note="get_trial_hits")
+    try:
+        return int(v or 0)
+    except:  # noqa
+        return 0
+
+async def incr_trial_hits(user_id: int, inc: int = 1) -> int:
+    if not rds: return 0
+    return await _safe_redis(rds.incrby(f"trial:hits:{user_id}", inc), default=0, note="incr_trial_hits")
+
+async def require_active_or_trial(update: Update) -> bool:
+    if PAYWALL_OFF:
+        return True
+    uid = update.effective_user.id
+    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@require")
+    if rds and paid is None:
+        # Redis caiu — não travar a conversa
+        log.warning("[PAYWALL-SOFT] Redis indisponível; liberando esta mensagem.")
+        return True
+    if paid and paid >= today():
+        return True
+    hits = await get_trial_hits(uid)
+    if hits < TRIAL_MAX_HITS:
+        return True
+    # bloqueia
+    html = (
+        "🔒 <b>Seu período de teste terminou</b>.\n"
+        f"Para continuar por {SUB_DAYS} dias: <a href='{esc(PAYMENT_LINK)}'>assine aqui</a>."
+    )
+    await send_html(update, html)
+    return False
 
 # =========================
 # ESTRATÉGIA CONSERVADORA
 # =========================
-def escolher_1_duzia_conservador(hist, K, stats):
+def escolher_1_duzia(hist, K, stats):
     if not hist:
-        return (False, None, {}, "Histórico vazio")
-
-    recent = hist[:K]
-    c_rec = _contagens_duzias(recent)
+        return (False, None, {}, "Histórico insuficiente")
+    rec = hist[-K:]  # últimos K
+    c_rec = _contagens_duzias(rec)
     c_glb = _contagens_duzias(hist)
 
-    # Ordena pelas que mais aparecem na janela recente; em empate, o global decide
     ordem = sorted(c_rec.items(), key=lambda x: (-x[1], -c_glb[x[0]]))
     d_top, v_top = ordem[0]
     d_second, v_second = ordem[1]
     gap = v_top - v_second
 
-    short = hist[:CONFIRM_REC]
+    short = hist[-CONFIRM_REC:] if len(hist) >= CONFIRM_REC else hist[:]
     c_short = _contagens_duzias(short)
-
     confirm_ok = c_short[d_top] >= REQUIRE_STREAK1
     min_gap = MIN_GAP1 + (GAP_BONUS_ON_COOLDOWN if stats["streak_miss"] >= COOLDOWN_MISSES else 0)
 
-    dbg = {
-        "rec": c_rec, "glb": c_glb, "short": c_short,
-        "top": d_top, "second": d_second, "gap": gap,
-        "require_streak": REQUIRE_STREAK1, "confirm_ok": confirm_ok, "min_gap": min_gap
-    }
+    dbg = {"rec": c_rec, "glb": c_glb, "short": c_short, "top": d_top, "second": d_second, "gap": gap, "min_gap": min_gap, "confirm_ok": confirm_ok}
 
     if not confirm_ok:
-        return (False, None, dbg, f"Sem confirmação recente ({c_short[d_top]}/{REQUIRE_STREAK1})")
-
+        return (False, None, dbg, f"Confirmação curta insuficiente ({c_short[d_top]}/{REQUIRE_STREAK1})")
     if gap < min_gap:
-        return (False, None, dbg, f"Vantagem insuficiente (gap={gap} < {min_gap})")
+        return (False, None, dbg, f"Gap insuficiente (gap={gap} < {min_gap})")
+    return (True, d_top, dbg, "Apto")
 
-    return (True, d_top, dbg, "Sinal confirmado")
-
-def escolher_2_duzias_conservador(hist, K, stats):
+def escolher_2_duzias(hist, K, stats):
     if not hist:
-        return (False, [], None, {}, "Histórico vazio")
-
+        return (False, [], None, {}, "Histórico insuficiente")
+    rec = hist[-K:]
+    c_rec = _contagens_duzias(rec)
     c_glb = _contagens_duzias(hist)
-    c_rec = _contagens_duzias(hist[:K])
 
     ordem = sorted(c_rec.items(), key=lambda x: (-x[1], -c_glb[x[0]]))
     d1, v1 = ordem[0]
     d2, v2 = ordem[1]
-    d3, v3 = ordem[2]  # excluída
+    d3, v3 = ordem[2]
     excl = d3
-
     gap23 = v2 - v3
 
-    short = hist[:CONFIRM_REC]
+    short = hist[-CONFIRM_REC:] if len(hist) >= CONFIRM_REC else hist[:]
     c_short = _contagens_duzias(short)
-
     confirm_ok = (c_short[d1] >= 1) or (c_short[d2] >= 1)
     min_gap2 = MIN_GAP2 + (GAP_BONUS_ON_COOLDOWN if stats["streak_miss"] >= COOLDOWN_MISSES else 0)
 
-    dbg = {
-        "rec": c_rec, "glb": c_glb, "short": c_short,
-        "top2": [d1, d2], "excl": excl,
-        "gap23": gap23, "min_gap2": min_gap2, "confirm_ok": confirm_ok
-    }
+    dbg = {"rec": c_rec, "glb": c_glb, "short": c_short, "top2": [d1, d2], "excl": excl, "gap23": gap23, "min_gap2": min_gap2, "confirm_ok": confirm_ok}
 
     if not confirm_ok:
-        return (False, [], excl, dbg, "Sem confirmação curta nas escolhidas")
-
+        return (False, [], excl, dbg, "Sem presença mínima na janela curtíssima")
     if gap23 < min_gap2:
-        return (False, [], excl, dbg, f"Vantagem insuficiente (gap23={gap23} < {min_gap2})")
-
-    return (True, [d1, d2], excl, dbg, "Sinal confirmado")
-
-# =========================
-# JUSTIFICATIVAS (SEM CITAÇÕES)
-# =========================
-def pick_justification(mode: int, ok: bool, dbg: dict, motivo: str | None) -> str:
-    """
-    Retorna uma justificativa curta e coerente com a decisão tomada.
-    Sem referências externas; linguagem neutra e conservadora.
-    """
-    lines = []
-
-    if ok:
-        # Entrou
-        if mode == 1:
-            gap = dbg.get("gap", "?")
-            min_gap = dbg.get("min_gap", "?")
-            confirm_ok = dbg.get("confirm_ok", False)
-            if confirm_ok and isinstance(gap, int) and isinstance(min_gap, int) and gap >= min_gap:
-                lines.append("Frequência recente da líder acima do mínimo e confirmada na janela curta.")
-                lines.append(f"Separação suficiente entre líder e segunda colocada (gap {gap} ≥ {min_gap}).")
-            elif confirm_ok:
-                lines.append("Confirmação recente atingida; vantagem moderada favorece a líder.")
-            else:
-                lines.append("Tendência consistente favorecendo a líder na janela recente.")
-        else:
-            # mode 2
-            gap23 = dbg.get("gap23", "?")
-            min_gap2 = dbg.get("min_gap2", "?")
-            excl = dbg.get("excl", "—")
-            confirm_ok = dbg.get("confirm_ok", False)
-            if confirm_ok and isinstance(gap23, int) and isinstance(min_gap2, int) and gap23 >= min_gap2:
-                lines.append("Duas dúzias mostram dominância frente à terceira.")
-                lines.append(f"Separação entre 2ª e 3ª atende ao mínimo (gap {gap23} ≥ {min_gap2}).")
-                lines.append(f"Dúzia excluída no momento: {excl}.")
-            elif confirm_ok:
-                lines.append("Pelo menos uma das escolhidas teve presença recente; combinação favorecida.")
-            else:
-                lines.append("Conjunto de duas dúzias com melhor comportamento relativo na janela recente.")
-    else:
-        # Não entrou (segurar)
-        m = (motivo or "").lower()
-
-        too_small_gap = ("gap=" in m) or ("vantagem insuficiente" in m) or ("gap23" in m)
-        no_confirm = ("sem confirmação" in m) or (dbg.get("confirm_ok") is False)
-        balanced = False
-
-        if mode == 1:
-            g = dbg.get("gap")
-            balanced = (isinstance(g, int) and g == 0)
-        else:
-            g23 = dbg.get("gap23")
-            balanced = (isinstance(g23, int) and g23 == 0)
-
-        if no_confirm:
-            lines.append("Confirmação recente insuficiente; melhor aguardar mais ocorrências.")
-        if too_small_gap:
-            if mode == 1:
-                lines.append("Separação entre líder e segunda colocada abaixo do mínimo exigido.")
-            else:
-                lines.append("Diferença entre 2ª e 3ª colocada abaixo do limiar de segurança.")
-        if balanced:
-            lines.append("Distribuição recente muito equilibrada; sem dominância clara.")
-
-        if not lines:
-            lines.append("Cenário ainda instável; aguardando evidências mais consistentes.")
-
-    return "• " + "\n• ".join(esc(s) for s in lines)
+        return (False, [], excl, dbg, f"Gap23 insuficiente (gap23={gap23} < {min_gap2})")
+    return (True, [d1, d2], excl, dbg, "Apto")
 
 # =========================
-# REDIS HELPERS + SAFE WRAPPER
+# JUSTIFICATIVAS (FORMAL/TÉCNICO)
 # =========================
-async def _safe_redis(coro, default=None, note=""):
-    try:
-        return await coro
-    except Exception as e:
-        logging.error(f"[REDIS-FAIL] {note}: {e}")
-        return default
+def just_apostar_1(dbg):
+    gap = dbg.get("gap", "?"); min_gap = dbg.get("min_gap", "?"); c_short = dbg.get("short", {})
+    d = dbg.get("top", "")
+    return (
+        f"Análise de força relativa indica dominância da {d} na janela recente, "
+        f"com separação estatística adequada (gap={gap} ≥ {min_gap}) e confirmação na janela curtíssima "
+        f"(ocorrências recentes: {c_short.get(d, 0)}). Essa configuração reduz dispersão e sustenta a tomada de posição."
+    )
 
-async def get_active_until(user_id: int):
-    if not rds:
-        return None
-    try:
-        v = await rds.get(f"sub:{user_id}")
-        if not v:
-            return None
-        return datetime.date.fromisoformat(v)
-    except Exception:
-        logging.exception("Redis GET falhou em get_active_until")
-        return None
+def just_apostar_2(dbg):
+    d1, d2 = dbg.get("top2", ["D?", "D?"])
+    gap23 = dbg.get("gap23", "?"); min_gap2 = dbg.get("min_gap2", "?")
+    excl = dbg.get("excl", "D?")
+    return (
+        f"A combinação {d1}+{d2} apresenta dominância frente à excluída ({excl}), "
+        f"com vantagem mínima entre 2ª e 3ª atendida (gap23={gap23} ≥ {min_gap2}). "
+        f"A presença recente em ao menos uma das selecionadas valida a entrada sob critério conservador."
+    )
 
-async def set_active_days(user_id: int, days: int = SUB_DAYS):
-    if not rds:
-        return None
-    try:
-        dt = today() + datetime.timedelta(days=days)
-        await rds.set(f"sub:{user_id}", dt.isoformat())
-        return dt
-    except Exception:
-        logging.exception("Redis SET falhou em set_active_days")
-        return None
+def just_aguardar_1(dbg, motivo):
+    gap = dbg.get("gap", "?"); min_gap = dbg.get("min_gap", "?"); d = dbg.get("top", "")
+    base = "A recomendação foi vetada por insuficiência de evidência robusta no curto prazo. "
+    if "Confirmação" in motivo or "curta" in motivo:
+        return base + (
+            f"A {d} não alcançou o mínimo de ocorrências exigido na janela curtíssima, "
+            f"o que impede caracterizar uma tendência confiável no momento."
+        )
+    if "Gap" in motivo or "gap" in motivo:
+        return base + (
+            f"A separação entre a líder e a segunda colocada é inferior ao limiar (gap={gap} < {min_gap}), "
+            f"caracterizando equilíbrio técnico e risco elevado de reversão."
+        )
+    return base + "O cenário indica distribuição mais uniforme entre as dúzias, recomendando observação adicional."
 
-async def set_trial_start_if_absent(user_id: int):
-    if not rds:
-        return None
-    try:
-        key = f"trial:start:{user_id}"
-        exists = await rds.exists(key)
-        if not exists:
-            await rds.set(key, today().isoformat())
-    except Exception:
-        logging.exception("Redis falhou em set_trial_start_if_absent")
-
-async def get_trial_hits(user_id: int) -> int:
-    if not rds:
-        return 0
-    try:
-        v = await rds.get(f"trial:hits:{user_id}")
-        return int(v) if v is not None else 0
-    except Exception:
-        logging.exception("Redis GET falhou em get_trial_hits")
-        return 0
-
-async def incr_trial_hits(user_id: int, inc: int = 1) -> int:
-    if not rds:
-        return 0
-    try:
-        return await rds.incrby(f"trial:hits:{user_id}", inc)
-    except Exception:
-        logging.exception("Redis INCR falhou em incr_trial_hits")
-        return 0
-
-async def get_trial_used(user_id: int) -> int:
-    if not rds:
-        return 0
-    try:
-        v = await rds.get(f"trial:used:{user_id}")
-        return int(v) if v is not None else 0
-    except Exception:
-        logging.exception("Redis GET falhou em get_trial_used")
-        return 0
-
-async def incr_trial_used(user_id: int, inc: int = 1) -> int:
-    if not rds:
-        return 0
-    try:
-        return await rds.incrby(f"trial:used:{user_id}", inc)
-    except Exception:
-        logging.exception("Redis INCR falhou em incr_trial_used")
-        return 0
-
-async def get_trial_info(user_id: int):
-    enabled = (TRIAL_MAX_HITS > 0) or (TRIAL_DAYS > 0) or (TRIAL_CAP > 0)
-    if not enabled or not rds:
-        return {
-            "enabled": False,
-            "hits": 0,
-            "hits_left": None,
-            "start": None,
-            "until": None,
-            "used": 0,
-            "days_left": None,
-            "uses_left": None
-        }
-
-    await set_trial_start_if_absent(user_id)
-
-    hits = await get_trial_hits(user_id)
-    hits_left = (TRIAL_MAX_HITS - hits) if (TRIAL_MAX_HITS > 0) else None
-
-    try:
-        start = await rds.get(f"trial:start:{user_id}")
-        start = datetime.date.fromisoformat(start) if start else None
-    except Exception:
-        logging.exception("Redis GET falhou em trial:start")
-        start = None
-
-    until = (start + datetime.timedelta(days=TRIAL_DAYS)) if (start and TRIAL_DAYS > 0) else None
-    days_left = (until - today()).days if until else None
-
-    used = await get_trial_used(user_id)
-    uses_left = (TRIAL_CAP - used) if (TRIAL_CAP > 0) else None
-
-    return {
-        "enabled": True,
-        "hits": hits,
-        "hits_left": hits_left,
-        "start": start,
-        "until": until,
-        "used": used,
-        "days_left": days_left,
-        "uses_left": uses_left,
-    }
-
-def trial_allows(trial: dict) -> bool:
-    if not trial.get("enabled"):
-        return False
-    if trial.get("hits_left") is not None and trial["hits_left"] <= 0:
-        return False
-    if trial.get("until") is not None and today() > trial["until"]:
-        return False
-    if trial.get("uses_left") is not None and trial["uses_left"] <= 0:
-        return False
-    return True
+def just_aguardar_2(dbg, motivo):
+    gap23 = dbg.get("gap23", "?"); min_gap2 = dbg.get("min_gap2", "?"); excl = dbg.get("excl", "D?")
+    base = "Sinal postergado por ausência de dominância estatística suficiente entre as três dúzias. "
+    if "presença" in motivo or "mínima" in motivo:
+        return base + (
+            "A janela curtíssima não registrou presença suficiente nas candidatas, "
+            "o que reduz a confiabilidade de continuidade no próximo giro."
+        )
+    if "gap23" in motivo or "Gap23" in motivo or "Gap" in motivo:
+        return base + (
+            f"A diferença entre a 2ª e a 3ª colocada não atingiu o limiar (gap23={gap23} < {min_gap2}), "
+            f"indicando instabilidade e risco de alternância."
+        )
+    return base + f"No momento, a dúzia excluída ({excl}) não se distancia o suficiente das selecionadas."
 
 # =========================
-# SCORE / FILA DE PREVISÕES
+# SCORE / PREVISÕES
 # =========================
 async def score_predictions(uid: int, nums: list[int]) -> bool:
-    """
-    Consome a fila de previsões (pred_queue) e marca hit/miss
-    conforme os números informados. Retorna True se o trial
-    acabou exatamente nesta validação (bateu TRIAL_MAX_HITS).
-    """
-    st = STATE[uid]
-    q = st["pred_queue"]
-    stats = st["stats"]
-
+    """Apura acertos/erros consumindo a fila de previsões. Retorna True se o trial estourou aqui."""
+    st = STATE[uid]; q = st["pred_queue"]; s = st["stats"]
     paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@score")
     on_trial = (not PAYWALL_OFF) and (not paid) and rds
     hit_limit_now = False
 
-    for n in reversed(nums):
+    # Consome os números na ordem de chegada (mais antigos primeiro)
+    for n in nums:
         d = get_duzia(n)
-        if d is None:
-            continue
-        if not q:
-            break
-        pred = q.pop(0)
+        if not d: continue
+        if not q: break
+        pred = q.pop(0)  # próxima previsão pendente
         hit = d in pred["duzias"]
         if hit:
-            stats["hits"] += 1
-            stats["streak_hit"] += 1
-            stats["streak_miss"] = 0
+            s["hits"] += 1; s["streak_hit"] += 1; s["streak_miss"] = 0
             if on_trial and TRIAL_MAX_HITS > 0:
                 new_hits = await _safe_redis(incr_trial_hits(uid, 1), default=0, note="incr_trial_hits")
                 if new_hits >= TRIAL_MAX_HITS:
                     hit_limit_now = True
         else:
-            stats["misses"] += 1
-            stats["streak_miss"] += 1
-            stats["streak_hit"] = 0
-
+            s["misses"] += 1; s["streak_miss"] += 1; s["streak_hit"] = 0
     return hit_limit_now
 
 # =========================
-# MENSAGENS
+# HANDLERS — COMANDOS
 # =========================
-async def send_html(update: Update, html: str):
-    # pequeno debounce para evitar FloodWait
-    await asyncio.sleep(0.05)
-    await update.message.reply_text(
-        html,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True
-    )
-
-# =========================
-# HANDLERS DE COMANDO
-# =========================
-async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_html(update, f"<b>Versão</b>: <code>{esc(APP_VERSION)}</code>")
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
     uid = update.effective_user.id
-
-    # garante início de trial se não for pago
-    if not PAYWALL_OFF and rds:
-        paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@start")
-        if not paid:
-            await _safe_redis(set_trial_start_if_absent(uid), default=None, note="trial_start@start")
-
-    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="trial_info@start")
-    trial_line = ""
-    if trial.get("enabled"):
-        if trial_allows(trial):
-            parts = []
-            if trial.get("hits_left") is not None:
-                parts.append(f"{trial['hits_left']} acerto(s)")
-            if trial.get("days_left") is not None:
-                parts.append(f"{trial['days_left']} dia(s)")
-            if trial.get("uses_left") is not None:
-                parts.append(f"{trial['uses_left']} análise(s)")
-            saldo = " • ".join(parts) if parts else "ativo"
-            trial_line = "\n🆓 <b>Teste</b>: " + esc(saldo) + " restante(s)."
-        else:
-            trial_line = "\n🆓 <b>Teste</b>: encerrado. Use /assinar para continuar."
-
-    html = f"""🎩 <b>Bem-vindo ao Analista de Dúzias</b>
-<i>Seu assistente que observa o "ritmo" das dúzias e só sugere quando o cenário está a favor.</i>
-
-👤 ID: <code>{esc(str(uid))}</code>{trial_line}
-
-🧠 <b>Como funciona</b>
-• Lemos os últimos resultados que você enviar.
-• Priorizamos o que está "quente" na janela recente, confirmando num trecho ainda mais curto (conservador).
-• Sinal só aparece quando há vantagem clara; do contrário, aconselho a aguardar.
-
-▶️ <b>Use assim</b>
-1) Envie números da roleta conforme forem saindo (ex.: <code>32 19 33 12 8</code>).
-2) Eu respondo com 1 ou 2 dúzias (conforme o modo) — ou digo para segurar a mão.
-3) Para melhor apuração de acertos, envie <b>um número por mensagem</b>.
-
-🛠️ <b>Comandos</b>
-• <code>/mode 1</code> — 1 dúzia  |  <code>/mode 2</code> — 2 dúzias
-• <code>/k 5</code> — janela recente (K)   |   <code>/n 80</code> — histórico (N)
-• <code>/stats</code> — seus acertos       |   <code>/resetstats</code> — zerar (se tiver)
-• <code>/assinar</code> — pagar            |   <code>/status</code> — ver validade
-• <code>/reset</code> — limpar histórico
-
-💡 Dica: consistência &gt; pressa. Se não houver vantagem estatística, não forçamos a jogada."""
+    hits = await get_trial_hits(uid) if rds else 0
+    hits_left = max(TRIAL_MAX_HITS - hits, 0)
+    html = (
+        f"🎩 <b>Analista de Dúzias</b>\n"
+        f"<i>Modo conservador ativo. Eu só recomendo quando a vantagem técnica está presente.</i>\n\n"
+        f"👤 ID: <code>{esc(str(uid))}</code>\n"
+        f"🆓 Teste grátis: <b>{hits_left}</b> acerto(s) restante(s) de {TRIAL_MAX_HITS}.\n\n"
+        "Envie os números conforme forem saindo (ex.: <code>32 19 33 12 8</code>). "
+        "Para melhor apuração de acertos, prefira enviar <b>um número por mensagem</b>."
+        "\n\nComandos:\n"
+        "• <code>/mode 1</code> — 1 dúzia | <code>/mode 2</code> — 2 dúzias\n"
+        "• <code>/k 5</code> — janela recente | <code>/n 80</code> — histórico\n"
+        "• <code>/stats</code> — seus acertos | <code>/reset</code> — limpar histórico\n"
+        "• <code>/assinar</code> — pagar | <code>/status</code> — ver validade"
+    )
     await send_html(update, html)
 
 async def cmd_assinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = PAYMENT_LINK
-    html = f"""💳 <b>Assinatura</b>
-Acesso por {SUB_DAYS} dias.
-
-➡️ Pague aqui: <a href='{esc(link)}'>Finalizar pagamento</a>
-Assim que aprovado, liberamos automaticamente. Use /status para conferir."""
+    html = (
+        f"💳 <b>Assinatura</b>\n"
+        f"Acesso por {SUB_DAYS} dias.\n\n"
+        f"➡️ <a href='{esc(PAYMENT_LINK)}'>Finalizar pagamento</a>\n"
+        f"Após aprovado, o acesso é liberado automaticamente."
+    )
     await send_html(update, html)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -520,284 +347,166 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if paid and paid >= today():
         await send_html(update, f"🟢 <b>Ativo</b> até <b>{paid.strftime('%d/%m/%Y')}</b>.")
         return
-
-    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="trial_info@status")
-    if trial.get("enabled"):
-        if trial_allows(trial):
-            parts = []
-            if trial.get("hits_left") is not None:
-                parts.append(f"{trial['hits_left']} acerto(s)")
-            if trial.get("days_left") is not None:
-                parts.append(f"{trial['days_left']} dia(s)")
-            if trial.get("uses_left") is not None:
-                parts.append(f"{trial['uses_left']} análise(s)")
-            saldo = " • ".join(parts) if parts else "ativo"
-            await send_html(update, f"🆓 <b>Em teste</b> — {esc(saldo)}.")
-        else:
-            await send_html(update, "🔴 <b>Inativo</b>. Seu período de teste encerrou. Use /assinar para continuar.")
+    hits = await get_trial_hits(uid)
+    hits_left = max(TRIAL_MAX_HITS - (hits or 0), 0)
+    if hits_left > 0:
+        await send_html(update, f"🆓 <b>Em teste</b> — {hits_left} acerto(s) restante(s).")
     else:
-        await send_html(update, "🔴 <b>Inativo</b>. Use /assinar para liberar seu acesso.")
-
-async def require_active_or_trial(update: Update) -> bool:
-    if PAYWALL_OFF:
-        return True
-
-    uid = update.effective_user.id
-    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@require")
-
-    # Se Redis indisponível, libera esta interação para não travar
-    if rds and paid is None:
-        logging.warning("[PAYWALL-SOFT] Redis indisponível; liberando esta mensagem.")
-        return True
-
-    if paid and paid >= today():
-        return True
-
-    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="get_trial_info@require")
-    if trial_allows(trial):
-        return True
-
-    link = PAYMENT_LINK
-    html = f"""🔒 <b>Seu teste terminou</b>.
-Para continuar por {SUB_DAYS} dias: <a href='{esc(link)}'>assine aqui</a>."""
-    await send_html(update, html)
-    return False
+        await send_html(update, "🔴 <b>Inativo</b>. Seu teste terminou. Use /assinar para continuar.")
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_active_or_trial(update):
-        return
+    if not await require_active_or_trial(update): return
     ensure_user(update.effective_user.id)
-    if context.args and context.args[0] == "1":
-        STATE[update.effective_user.id]["modo"] = 1
-        await send_html(update, "🎛️ Modo: <b>1 dúzia</b>.")
-    else:
-        STATE[update.effective_user.id]["modo"] = 2
-        await send_html(update, "🎛️ Modo: <b>2 dúzias</b>.")
+    arg = (context.args[0] if context.args else "2").strip()
+    STATE[update.effective_user.id]["modo"] = 1 if arg == "1" else 2
+    await send_html(update, f"🎛️ Modo: <b>{'1 dúzia' if arg=='1' else '2 dúzias'}</b>.")
 
 async def cmd_k(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_active_or_trial(update):
-        return
+    if not await require_active_or_trial(update): return
     ensure_user(update.effective_user.id)
     if context.args and context.args[0].isdigit():
         STATE[update.effective_user.id]["K"] = max(1, min(50, int(context.args[0])))
     await send_html(update, f"⚙️ K=<b>{STATE[update.effective_user.id]['K']}</b>.")
 
 async def cmd_n(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_active_or_trial(update):
-        return
+    if not await require_active_or_trial(update): return
     ensure_user(update.effective_user.id)
     if context.args and context.args[0].isdigit():
         N = max(10, min(1000, int(context.args[0])))
         STATE[update.effective_user.id]["N"] = N
-        STATE[update.effective_user.id]["hist"] = STATE[update.effective_user.id]["hist"][:N]
+        STATE[update.effective_user.id]["hist"] = STATE[update.effective_user.id]["hist"][-N:]
     await send_html(update, f"⚙️ N=<b>{STATE[update.effective_user.id]['N']}</b>.")
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_active_or_trial(update):
-        return
+    if not await require_active_or_trial(update): return
     ensure_user(update.effective_user.id)
     STATE[update.effective_user.id]["hist"] = []
     STATE[update.effective_user.id]["pred_queue"] = []
     await send_html(update, "🧹 Histórico limpo.")
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_active_or_trial(update):
-        return
+    if not await require_active_or_trial(update): return
     ensure_user(update.effective_user.id)
-
     s = STATE[update.effective_user.id]["stats"]
     p = len(STATE[update.effective_user.id]["pred_queue"])
-
-    trial = await _safe_redis(get_trial_info(update.effective_user.id), default={"enabled": False}, note="trial_info@stats")
-    tline = ""
-    if trial.get("enabled"):
-        if trial_allows(trial):
-            rem = []
-            if trial.get("hits_left") is not None:
-                rem.append(f"{trial['hits_left']} acerto(s)")
-            if trial.get("days_left") is not None:
-                rem.append(f"{trial['days_left']} dia(s)")
-            if trial.get("uses_left") is not None:
-                rem.append(f"{trial['uses_left']} análise(s)")
-            tline = "\n🆓 Teste: " + esc(" • ".join(rem) if rem else "ativo")
-        else:
-            tline = "\n🆓 Teste: encerrado"
-
-    html = f"""📈 <b>Resultados</b>
-• ✅ Acertos: <b>{s['hits']}</b>
-• ❌ Erros: <b>{s['misses']}</b>
-• 🎯 Taxa: <b>{pct(s['hits'], s['misses'])}%</b>
-• 🔁 Pendentes: <b>{p}</b>
-• 🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{tline}"""
+    html = (
+        "📈 <b>Resultados</b>\n"
+        f"• ✅ Acertos: <b>{s['hits']}</b>\n"
+        f"• ❌ Erros: <b>{s['misses']}</b>\n"
+        f"• 🎯 Taxa: <b>{pct(s['hits'], s['misses'])}%</b>\n"
+        f"• 🔁 Pendentes: <b>{p}</b>"
+    )
     await send_html(update, html)
 
 # =========================
-# DEBUG / ERROS
-# =========================
-async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    redis_ok = False
-    try:
-        if rds:
-            pong = await rds.ping()
-            redis_ok = bool(pong)
-    except Exception as e:
-        logging.error(f"[DIAG] Redis ping fail: {e}")
-    paid = await _safe_redis(get_active_until(uid), default=None, note="diag get_active_until")
-    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="diag get_trial_info")
-    st = STATE.get(uid, {})
-    html = f"""🛠️ <b>Diagnóstico</b>
-• Redis: <b>{"OK" if redis_ok else "OFF"}</b>
-• Pago até: <b>{paid.strftime('%d/%m/%Y') if paid else "—"}</b>
-• Trial: <b>{"on" if trial.get("enabled") else "off"}</b>
-• Modo: <b>{st.get('modo',"—")}</b> • K: <b>{st.get('K',"—")}</b> • N: <b>{st.get('N',"—")}</b>
-• Fila pendente: <b>{len(st.get('pred_queue',[]))}</b>"""
-    await send_html(update, html)
-
-async def debug_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if update and update.message:
-            logging.info(f"[DBG] Chat {update.effective_chat.id} -> {update.message.text!r}")
-    except Exception:
-        logging.exception("Erro no debug_tap")
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    import traceback
-    tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
-    logging.error("PTB ERROR:\n%s", tb)
-    try:
-        if isinstance(update, Update) and update.effective_chat:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ Ocorreu um erro interno. Já registrei nos logs."
-            )
-    except Exception:
-        pass
-
-# =========================
-# HANDLER PRINCIPAL DE TEXTO
+# HANDLER PRINCIPAL (TEXTO)
 # =========================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"[FLOW] begin handle_text uid={update.effective_user.id} txt={update.message.text!r}")
-
-    txt = (update.message.text or "").strip().lower()
-    if txt in ["/start", "/assinar", "/status", "/version", "/diag"]:
-        return
-
     ensure_user(update.effective_user.id)
     uid = update.effective_user.id
 
-    # 1) Primeiro valida previsões pendentes com os números enviados
-    nums_now = [int(x) for x in re.findall(r"\d+", update.message.text or "")]
-    hit_limit_now = await score_predictions(uid, nums_now)
-    logging.info(f"[FLOW] after score_predictions uid={uid} hit_limit_now={hit_limit_now}")
+    # Anti-flood por usuário
+    now = datetime.datetime.utcnow()
+    last = STATE[uid]["last_touch"]
+    if last and (now - last).total_seconds() < MIN_GAP_SECONDS:
+        return
+    STATE[uid]["last_touch"] = now
 
-    # Se o trial estourou aqui, bloqueia e envia link
+    txt = (update.message.text or "").strip()
+    nums = [int(x) for x in re.findall(r"\d+", txt)]
+    if not nums:
+        await send_html(update, "Envie números (ex.: <code>32 19 33 12 8</code>).")
+        return
+
+    # 1) Apura previsões pendentes em blocos (evita travar)
+    nums = nums[:MAX_NUMS_PER_MSG]
+    hit_limit_now = False
+    for i in range(0, len(nums), CHUNK):
+        bloc = nums[i:i+CHUNK]
+        if await score_predictions(uid, bloc):
+            hit_limit_now = True
+        await asyncio.sleep(0.05)
     if hit_limit_now and not PAYWALL_OFF:
-        link = PAYMENT_LINK
-        html = f"""🆓 <b>Período de teste encerrado</b> — você atingiu o limite de <b>{TRIAL_MAX_HITS} acertos</b>.
-Para continuar por {SUB_DAYS} dias: <a href='{esc(link)}'>assine aqui</a>."""
+        html = (
+            f"🆓 <b>Período de teste encerrado</b> — limite de <b>{TRIAL_MAX_HITS}</b> acertos atingido.\n"
+            f"Para continuar por {SUB_DAYS} dias: <a href='{esc(PAYMENT_LINK)}'>assine aqui</a>."
+        )
         await send_html(update, html)
         return
 
-    logging.info(f"[FLOW] before require_active_or_trial uid={uid}")
+    # 2) Paywall/trial
     if not await require_active_or_trial(update):
         return
-    logging.info(f"[FLOW] passed require_active_or_trial uid={uid}")
 
-    if not nums_now:
-        await send_html(update, "Envie números (ex.: <code>32 19 33 12 8</code>) ou <code>/start</code>.")
-        return
-
-    # 2) Atualiza histórico e calcula próxima recomendação
+    # 3) Atualiza histórico global do usuário
     st = STATE[uid]
-    st["hist"] = (nums_now + st["hist"])[:st["N"]]
+    st["hist"].extend(nums)
+    st["hist"] = st["hist"][-st["N"]:]
     K = st["K"]
-    N = len(st["hist"])
     s = st["stats"]
-    logging.info(f"[FLOW] computing recs uid={uid} mode={st['modo']} K={K} N={N}")
 
-    # Info de trial para exibir “acertos restantes” no rodapé da resposta
-    paid_now = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@reply")
-    trial = await _safe_redis(get_trial_info(uid), default={"enabled": False}, note="trial_info@reply") if (rds and not PAYWALL_OFF and not paid_now) else {"enabled": False}
-    trial_footer = ""
-    if trial.get("enabled") and trial_allows(trial):
-        parts = []
-        if trial.get("hits_left") is not None:
-            parts.append(f"{trial['hits_left']} acerto(s)")
-        if trial.get("days_left") is not None:
-            parts.append(f"{trial['days_left']} dia(s)")
-        if trial.get("uses_left") is not None:
-            parts.append(f"{trial['uses_left']} análise(s)")
-        if parts:
-            trial_footer = "\n🆓 Teste: " + esc(" • ".join(parts)) + " restante(s)."
-
+    # 4) Executa estratégia (modo conservador)
     if st["modo"] == 1:
-        ok, duzia, dbg, motivo = escolher_1_duzia_conservador(st["hist"], K, s)
+        ok, duzia, dbg, motivo = escolher_1_duzia(st["hist"], K, s)
+        hits = await get_trial_hits(uid) if rds else 0
+        hits_left = max(TRIAL_MAX_HITS - hits, 0)
+
         if not ok:
-            html = f"""⏸️ <b>Sem aposta agora</b>
-Motivo: {esc(motivo)}
-🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
-📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
-🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
-            if JUSTIFY_ON:
-                html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(1, ok=False, dbg=dbg, motivo=motivo)}"
-            logging.info(f"[FLOW] sending reply uid={uid} mode=1 (NO-ENTRY)")
+            jus = just_aguardar_1(dbg, motivo)
+            html = (
+                "⏸️ <b>Sem entrada agora</b>\n"
+                f"📊 <b>Motivo técnico:</b> {esc(motivo)}\n"
+                f"📖 <b>Justificativa:</b> {esc(jus)}\n"
+                f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+            )
             await send_html(update, html)
             return
 
+        # Registrar previsão pendente
         st["pred_queue"].append({"modo": 1, "duzias": [duzia]})
         pend = len(st["pred_queue"])
-        html = f"""🎯 <b>Dúzia</b>: <b>{duzia}</b>  •  ✅ Confirmação OK
-🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
-📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
-—
-✅ <b>Acertos</b>: <b>{s['hits']}</b> / <b>{s['hits']+s['misses']}</b> (<b>{pct(s['hits'], s['misses'])}%</b>)  |  🔁 Pendentes: <b>{pend}</b>
-🔥 <b>Streak</b>: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
-        if JUSTIFY_ON:
-            html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(1, ok=True, dbg=dbg, motivo=None)}"
-        logging.info(f"[FLOW] sending reply uid={uid} mode=1 (ENTRY)")
+        jus = just_apostar_1(dbg)
+        html = (
+            f"🎯 <b>Recomendação:</b> Apostar em <b>{duzia}</b>\n"
+            f"📖 <b>Justificativa técnica:</b> {esc(jus)}\n"
+            f"🔁 Pendentes: <b>{pend}</b>\n"
+            f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+        )
         await send_html(update, html)
 
     else:
-        ok, duzias, excl, dbg, motivo = escolher_2_duzias_conservador(st["hist"], K, s)
+        ok, duzias, excl, dbg, motivo = escolher_2_duzias(st["hist"], K, s)
+        hits = await get_trial_hits(uid) if rds else 0
+        hits_left = max(TRIAL_MAX_HITS - hits, 0)
+
         if not ok:
-            html = f"""⏸️ <b>Sem aposta agora</b>
-Motivo: {esc(motivo)}
-🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
-📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
-🔥 Streak: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
-            if JUSTIFY_ON:
-                html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(2, ok=False, dbg=dbg, motivo=motivo)}"
-            logging.info(f"[FLOW] sending reply uid={uid} mode=2 (NO-ENTRY)")
+            jus = just_aguardar_2(dbg, motivo)
+            html = (
+                "⏸️ <b>Sem entrada agora</b>\n"
+                f"📊 <b>Motivo técnico:</b> {esc(motivo)}\n"
+                f"📖 <b>Justificativa:</b> {esc(jus)}\n"
+                f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+            )
             await send_html(update, html)
             return
 
         st["pred_queue"].append({"modo": 2, "duzias": duzias})
         pend = len(st["pred_queue"])
-        html = f"""🎯 <b>Dúzias</b>: <b>{duzias[0]}</b> + <b>{duzias[1]}</b>  |  🚫 Excluída: <b>{excl}</b>  •  ✅ Confirmação OK
-🪄 Recentes (K={K}): D1=<b>{dbg['rec']['D1']}</b> • D2=<b>{dbg['rec']['D2']}</b> • D3=<b>{dbg['rec']['D3']}</b>
-📊 Geral (N={N}): D1=<b>{dbg['glb']['D1']}</b> • D2=<b>{dbg['glb']['D2']}</b> • D3=<b>{dbg['glb']['D3']}</b>
-—
-✅ <b>Acertos</b>: <b>{s['hits']}</b> / <b>{s['hits']+s['misses']}</b> (<b>{pct(s['hits'], s['misses'])}%</b>)  |  🔁 Pendentes: <b>{pend}</b>
-🔥 <b>Streak</b>: <b>{s['streak_hit']}✔️</b> | <b>{s['streak_miss']}❌</b>{trial_footer}"""
-        if JUSTIFY_ON:
-            html += f"\n\n📚 <b>Justificativa</b>\n{pick_justification(2, ok=True, dbg=dbg, motivo=None)}"
-        logging.info(f"[FLOW] sending reply uid={uid} mode=2 (ENTRY)")
+        jus = just_apostar_2(dbg)
+        html = (
+            f"🎯 <b>Recomendação:</b> Apostar em <b>{duzias[0]}</b> + <b>{duzias[1]}</b>  |  🚫 Excluída: <b>{excl}</b>\n"
+            f"📖 <b>Justificativa técnica:</b> {esc(jus)}\n"
+            f"🔁 Pendentes: <b>{pend}</b>\n"
+            f"🆓 Teste: {hits_left} acerto(s) restante(s)."
+        )
         await send_html(update, html)
 
 # =========================
-# TELEGRAM + AIOHTTP (WEBHOOK)
+# AIOHTTP + TELEGRAM (WEBHOOK)
 # =========================
-application = Application.builder().token(TOKEN).build()
-
-# Debug e erros
-application.add_handler(CommandHandler("diag", cmd_diag))
-application.add_handler(MessageHandler(filters.ALL, debug_tap), group=-1)
-application.add_error_handler(on_error)
+application = Application.builder().token(TELEGRAM_TOKEN).build()
 
 # Comandos
-application.add_handler(CommandHandler("version", cmd_version))
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("assinar", cmd_assinar))
 application.add_handler(CommandHandler("status", cmd_status))
@@ -807,10 +516,10 @@ application.add_handler(CommandHandler("n", cmd_n))
 application.add_handler(CommandHandler("reset", cmd_reset))
 application.add_handler(CommandHandler("stats", cmd_stats))
 
-# Texto comum
+# Texto
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-# AIOHTTP app (Render)
+# Web app
 aio = web.Application()
 
 async def tg_handler(request: web.Request):
@@ -820,38 +529,34 @@ async def tg_handler(request: web.Request):
     return web.Response(text="ok")
 
 async def payments_handler(request: web.Request):
-    # Webhook de pagamento (opcional). Espera JSON {"status":"paid","user_id":123}
+    # Webhook opcional de pagamento: espera JSON {"status":"paid","user_id":123}
     data = await request.json()
     if data.get("status") == "paid" and "user_id" in data:
         uid = int(data["user_id"])
-        dt = await _safe_redis(set_active_days(uid, SUB_DAYS), default=None, note="payments set_active_days")
+        dt = await set_active_days(uid, SUB_DAYS)
         return web.json_response({"ok": True, "active_until": dt.isoformat() if dt else None})
     return web.json_response({"ok": False})
 
 async def health_handler(request: web.Request):
     return web.Response(text="ok")
 
+async def root_handler(request: web.Request):
+    return web.Response(text="ok")
+
 aio.router.add_post(f"/{TG_PATH}", tg_handler)
 aio.router.add_post("/payments/webhook", payments_handler)
 aio.router.add_get("/health", health_handler)
-
-# ⇩ NOVO: responder 200 no root para o health check padrão do Render
-async def root_handler(request):
-    return web.Response(text="ok")
-
 aio.router.add_get("/", root_handler)
 
 async def on_startup(app: web.Application):
-    print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS} | PAYWALL_OFF={PAYWALL_OFF} | JUSTIFY_ON={JUSTIFY_ON}")
-    if not TOKEN:
-        raise RuntimeError("Defina TELEGRAM_TOKEN")
+    print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS}")
     await application.initialize()
     await application.start()
     if PUBLIC_URL:
         await application.bot.set_webhook(url=f"{PUBLIC_URL}/{TG_PATH}", drop_pending_updates=True)
         print("✅ Webhook setado.")
     else:
-        print("⚠️ PUBLIC_URL vazio — defina para usar webhook.")
+        print("⚠️ Defina PUBLIC_URL para habilitar o webhook.")
 
 async def on_cleanup(app: web.Application):
     try:
