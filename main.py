@@ -34,7 +34,7 @@ DEFAULTS = {
     "history": [],   # sequência de números informados
     "wins": 0,
     "losses": 0,
-    "events": [],    # log por giro: dict(number, dz, blocked, outcome: 'win'|'loss'|'skip')
+    "events": [],    # log por giro: {number, dz, blocked, outcome, d1, d2, excl}
 }
 
 # Probabilidades (roleta europeia 37 números): referência matemática
@@ -104,12 +104,20 @@ def status_text(s: Dict[str, Any]) -> str:
     )
 
 def apply_spin(s: Dict[str, Any], number: int) -> str:
-    s["history"].append(number)
+    """
+    Calcula a recomendação com base no histórico ANTERIOR,
+    decide vitória/derrota com essa recomendação e SÓ ENTÃO grava o número.
+    Também exibe textualmente a recomendação pré-giro.
+    """
+    # 1) Recomendação com base no histórico anterior ao giro
     d1, d2, excl, bloquear = pick_two_dozens_auto(s["history"])
     dz = dozen_of(number)
 
+    recomendacao_txt = f"🎯 Recomendado antes do giro: {esc(d1)} + {esc(d2)}  |  🚫 Excluída: {esc(excl)}"
+
+    # 2) Bloqueio por zero recente (sem contar vitória/derrota)
     if bloquear:
-        # Não conta vitória/derrota — outcome = skip
+        s["history"].append(number)
         s["events"].append({
             "number": number, "dz": dz, "blocked": True, "outcome": "skip",
             "d1": d1, "d2": d2, "excl": excl
@@ -117,13 +125,14 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
         header = bet_header(d1, d2, excl)
         return (
             f"{header}\n"
+            f"{recomendacao_txt}\n"
             "— — —\n"
             f"🛑 Zero recente detectado. <b>Evite entrada nesta rodada.</b>\n"
             f"🎲 Resultado informado: <b>{number}</b> ({'zero' if number == 0 else dz})\n"
             f"{status_text(s)}"
         )
 
-    # Resultado da rodada com base nas duas dúzias recomendadas
+    # 3) Resultado contra a recomendação pré-giro
     if dz in {d1, d2}:
         s["wins"] += 1
         outcome = "win"
@@ -133,6 +142,8 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
         outcome = "loss"
         line = f"❌ <b>Derrota</b> — saiu {number} ({'zero' if number == 0 else dz})."
 
+    # 4) Registrar histórico + evento
+    s["history"].append(number)
     s["events"].append({
         "number": number, "dz": dz, "blocked": False, "outcome": outcome,
         "d1": d1, "d2": d2, "excl": excl
@@ -141,28 +152,52 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
     header = bet_header(d1, d2, excl)
     return (
         f"{header}\n"
+        f"{recomendacao_txt}\n"
         "— — —\n"
         f"🎲 Resultado: <b>{number}</b>  |  {line}\n"
         f"{status_text(s)}"
     )
 
 def apply_undo(s: Dict[str, Any]) -> str:
+    """
+    Desfaz o último giro, ajusta estatísticas e exibe:
+    - a recomendação pré-giro do lance desfeito
+    - a recomendação atual (com o histórico já corrigido)
+    """
     if not s["history"]:
         return "Nada para desfazer."
+
+    # Remove último número + evento
     last_num = s["history"].pop()
     last_event = s["events"].pop() if s["events"] else None
+    last_dz = dozen_of(last_num)
 
-    # Reverte estatísticas se necessário
+    # Ajuste de estatística se contou
     if last_event and not last_event.get("blocked", False):
         if last_event.get("outcome") == "win":
             s["wins"] = max(0, s["wins"] - 1)
         elif last_event.get("outcome") == "loss":
             s["losses"] = max(0, s["losses"] - 1)
 
-    dz = dozen_of(last_num)
+    # Recomendação pré-giro do lance desfeito
+    prev_d1 = last_event.get("d1") if last_event else None
+    prev_d2 = last_event.get("d2") if last_event else None
+    prev_excl = last_event.get("excl") if last_event else None
+    prev_rec_txt = (
+        f"🎯 <b>Rec. pré-giro desfeito</b>: {esc(prev_d1)} + {esc(prev_d2)}  |  🚫 {esc(prev_excl)}"
+        if (prev_d1 and prev_d2 and prev_excl) else
+        "🎯 <b>Rec. pré-giro desfeito</b>: (indisponível)"
+    )
+
+    # Recomendação atual (histórico já corrigido)
+    cur_d1, cur_d2, cur_excl, _ = pick_two_dozens_auto(s["history"])
+    cur_rec_txt = f"🧭 <b>Rec. atual</b>: {esc(cur_d1)} + {esc(cur_d2)}  |  🚫 {esc(cur_excl)}"
+
     return (
         "↩️ <b>Undo feito</b>\n"
-        f"• Removido: {last_num} ({'zero' if last_num == 0 else dz})\n"
+        f"• Removido: {last_num} ({'zero' if last_num == 0 else last_dz})\n"
+        f"{prev_rec_txt}\n"
+        f"{cur_rec_txt}\n"
         f"{status_text(s)}"
     )
 
@@ -224,7 +259,6 @@ BASE_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
 if not BASE_URL:
     raise RuntimeError("Defina PUBLIC_URL (ou deixe o Render expor RENDER_EXTERNAL_URL).")
 
-PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH") or secrets.token_urlsafe(32)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # opcional
 
@@ -255,7 +289,7 @@ async def on_startup():
         log.warning("Último erro do Telegram: %s (há %ss)", info.last_error_message, info.last_error_date)
 
     await application.start()
-    log.info("Application started (PTB + FastAPI). Path=/%s  Porta=%s  Build=%s", WEBHOOK_PATH, PORT, BUILD_TAG)
+    log.info("Application started (PTB + FastAPI). Path=/%s  Build=%s", WEBHOOK_PATH, BUILD_TAG)
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -284,11 +318,3 @@ async def telegram_webhook(request: Request):
         log.exception("Webhook handler exception: %s", e)
         # 200 evita retry agressivo do Telegram e não derruba o servidor
         return Response(status_code=status.HTTP_200_OK)
-
-# -----------------------------------------------------------------------------
-# ENTRYPOINT UVICORN
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    log.info("Subindo Uvicorn em 0.0.0.0:%s ... Build=%s", PORT, BUILD_TAG)
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
