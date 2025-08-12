@@ -1,4 +1,5 @@
 import os
+import secrets
 from typing import Dict, Any, List, Tuple
 from telegram import Update
 from telegram.ext import (
@@ -17,10 +18,10 @@ DEFAULTS = {
     "events": [],    # log por giro: dict(number, dz, blocked, outcome: 'win'|'loss'|'skip')
 }
 
-# Probabilidades (roleta europeia 37 números) — Barboianu
-P_VITORIA = 24/37        # duas dúzias
+# Probabilidades (roleta europeia 37 números) — referência matemática
+P_VITORIA = 24 / 37
 P_DERROTA = 1 - P_VITORIA
-EV_POR_STAKE = P_VITORIA*(+1) + P_DERROTA*(-2)  # ~ -0,02703 (−2,703%) por rodada (referência teórica)
+EV_POR_STAKE = P_VITORIA * (+1) + P_DERROTA * (-2)  # ~ -0,02703 (−2,703%) por rodada (duas dúzias)
 
 def get_state(chat_id: int) -> Dict[str, Any]:
     if chat_id not in STATE:
@@ -66,7 +67,7 @@ def bet_header(d1: str, d2: str, excl: str) -> str:
     ev_pct = -EV_POR_STAKE * 100.0  # valor positivo para exibição (~2,70%)
     return (
         f"🎯 *Recomendação*: {d1} + {d2}  |  🚫 *Excluída*: {excl}\n"
-        f"📈 Prob. teórica (Barboianu): ~64,86%  |  🧮 EV teórico: ~{ev_pct:.2f}% contra o apostador"
+        f"📈 Prob. teórica: ~64,86%  |  🧮 EV teórico: ~{ev_pct:.2f}% contra o apostador"
     )
 
 def status_text(s: Dict[str, Any]) -> str:
@@ -75,7 +76,7 @@ def status_text(s: Dict[str, Any]) -> str:
     return (
         "📊 *Status*\n"
         f"• Acertos: {s['wins']}  |  Erros: {s['losses']}  |  Taxa de acerto: {hit:.1f}%\n"
-        f"• Giros lidos: {total}\n"
+        f"• Giros lidos (com entrada): {total}\n"
         "• Janela de tendência: últimos 12 giros"
     )
 
@@ -144,21 +145,18 @@ def apply_undo(s: Dict[str, Any]) -> str:
     )
 
 # -----------------------------
-# Handlers
+# Handlers do bot
 # -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_state(update.effective_chat.id)
     text = (
-        "🤖 *Bot de Roleta — Duas Dúzias*\n"
-        "Base matemática (Barboianu) e gatilhos práticos (tendência + evitar zero recente).\n\n"
-        "*Como usar:*\n"
-        "• Simplesmente *envie o número* que saiu (0–36).\n"
-        "• O bot recomenda as *duas dúzias* com maior frequência recente e marca a excluída.\n"
-        "• Evita sugerir entrada quando o *zero* apareceu nos últimos 2 giros.\n\n"
+        "🤖 *Bot de Roleta — Duas Dúzias* (Webhook)\n"
+        "• Envie o número que saiu (0–36) e eu recomendo as duas dúzias.\n"
+        "• Evito entrada quando o zero apareceu nos últimos 2 giros.\n\n"
         "*Comandos:*\n"
-        "/status — mostra acertos/erros e janela usada\n"
-        "/reset — zera histórico e estatísticas\n"
-        "/undo — desfaz o *último* giro informado"
+        "/status — mostra acertos/erros\n"
+        "/reset — zera histórico\n"
+        "/undo — desfaz o último giro"
     )
     await update.message.reply_markdown_v2(text)
 
@@ -183,11 +181,10 @@ async def on_number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_state(update.effective_chat.id)
     text = (update.message.text or "").strip()
 
-    # aceita mensagens como "26", "  7  ", até listas curtas "26, 7" (pega o primeiro inteiro)
     import re
     m = re.search(r"(?<!\d)(\d{1,2})(?!\d)", text)
     if not m:
-        await update.message.reply_text("Envie apenas um número entre 0 e 36. Use /undo para desfazer o último giro.")
+        await update.message.reply_text("Envie um número entre 0 e 36. Use /undo para desfazer o último giro.")
         return
 
     n = int(m.group(1))
@@ -196,29 +193,44 @@ async def on_number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     resp = apply_spin(s, n)
-    # escapar markdown v2 básico
     resp = resp.replace("-", r"\-")
     await update.message.reply_markdown_v2(resp)
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Defina a variável de ambiente BOT_TOKEN com o token do BotFather.")
 
-    app = Application.builder().token(token).build()
+    # URL pública do serviço
+    base_url = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if not base_url:
+        raise RuntimeError("Defina PUBLIC_URL (ou use RENDER_EXTERNAL_URL do Render) para registrar o webhook.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("reset", reset_cmd))
-    app.add_handler(CommandHandler("undo", undo_cmd))
+    # Porta fornecida pelo Render
+    port = int(os.getenv("PORT", "10000"))
+    # Caminho secreto do webhook (evite expor o token). Pode setar WEBHOOK_PATH manualmente se quiser.
+    webhook_path = os.getenv("WEBHOOK_PATH") or secrets.token_urlsafe(32)
+    # Token secreto do header do Telegram (opcional, mas recomendado)
+    secret_token = os.getenv("WEBHOOK_SECRET")
 
-    # Qualquer texto que contenha um número 0–36 vira entrada de rodada
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_message))
+    application = Application.builder().token(token).build()
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("reset", reset_cmd))
+    application.add_handler(CommandHandler("undo", undo_cmd))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_message))
+
+    # Inicia servidor webhook embutido (aiohttp) e registra URL no Telegram
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path,
+        webhook_url=f"{base_url.rstrip('/')}/{webhook_path}",
+        secret_token=secret_token,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
