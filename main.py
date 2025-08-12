@@ -4,23 +4,27 @@ import re
 import logging
 import secrets
 from typing import Dict, Any, List, Tuple
+
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import PlainTextResponse
+
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # LOGGING
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("roulette-bot")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # ESTADO EM MEMÓRIA
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 STATE: Dict[int, Dict[str, Any]] = {}
 DEFAULTS = {
     "history": [],   # sequência de números informados
@@ -35,9 +39,9 @@ P_DERROTA = 1 - P_VITORIA
 # EV teórico por rodada (duas dúzias) em "unidades de stake" (apenas referência informativa)
 EV_POR_STAKE = P_VITORIA * (+1) + P_DERROTA * (-2)  # ≈ -0.02703 (−2.703%)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # FUNÇÕES DE NEGÓCIO
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def get_state(chat_id: int) -> Dict[str, Any]:
     if chat_id not in STATE:
         STATE[chat_id] = {k: (v.copy() if isinstance(v, list) else v) for k, v in DEFAULTS.items()}
@@ -158,13 +162,13 @@ def apply_undo(s: Dict[str, Any]) -> str:
         f"{status_text(s)}"
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HANDLERS
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# HANDLERS DO BOT
+# -----------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_state(update.effective_chat.id)
     text = (
-        "🤖 *Bot de Roleta — Duas Dúzias* (Webhook)\n"
+        "🤖 *Bot de Roleta — Duas Dúzias* (Webhook/FastAPI)\n"
         "• Envie o número que saiu (0–36) e eu recomendo as duas dúzias.\n"
         "• Evito entrada quando o zero apareceu nos últimos 2 giros.\n\n"
         "*Comandos:*\n"
@@ -205,54 +209,97 @@ async def on_number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     resp = apply_spin(s, n).replace("-", r"\-")
     await update.message.reply_markdown_v2(resp)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN (WEBHOOK)
-# ──────────────────────────────────────────────────────────────────────────────
-def main():
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("Defina a variável de ambiente BOT_TOKEN com o token do BotFather.")
+# -----------------------------------------------------------------------------
+# APP FASTAPI + INTEGRAÇÃO PTB
+# -----------------------------------------------------------------------------
+# Ambiente
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Defina a variável de ambiente BOT_TOKEN com o token do BotFather.")
 
-    base_url = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
-    if not base_url:
-        raise RuntimeError("Defina PUBLIC_URL (ou deixe o Render expor RENDER_EXTERNAL_URL).")
+BASE_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+if not BASE_URL:
+    raise RuntimeError("Defina PUBLIC_URL (ou deixe o Render expor RENDER_EXTERNAL_URL).")
 
-    port = int(os.getenv("PORT", "10000"))
-    webhook_path = os.getenv("WEBHOOK_PATH") or secrets.token_urlsafe(32)
-    secret_token = os.getenv("WEBHOOK_SECRET")  # opcional, mas recomendado
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH") or secrets.token_urlsafe(32)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # opcional
 
-    log.info("Iniciando bot (PTB webhook)…")
-    log.info("PTB versão: tentando importar…")
-    try:
-        import telegram
-        log.info("python-telegram-bot: %s", getattr(telegram, "__version__", "desconhecida"))
-    except Exception as e:
-        log.warning("Falha ao obter versão do PTB: %s", e)
+# Cria a Application do PTB
+application = Application.builder().token(BOT_TOKEN).build()
+# Registra handlers
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("status", status_cmd))
+application.add_handler(CommandHandler("reset", reset_cmd))
+application.add_handler(CommandHandler("undo", undo_cmd))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_message))
 
-    log.info("Config webhook:")
-    log.info("  URL base: %s", base_url)
-    log.info("  Porta: %s", port)
-    log.info("  Path: /%s", webhook_path)
-    log.info("  Secret token definido? %s", "sim" if secret_token else "não")
+# Cria FastAPI
+app = FastAPI(title="Roulette Double Dozens Bot", version="1.0.0")
 
-    application = Application.builder().token(token).build()
+@app.on_event("startup")
+async def on_startup():
+    # Inicializa PTB e registra webhook explicitamente
+    webhook_url = f"{BASE_URL.rstrip('/')}/{WEBHOOK_PATH}"
+    log.info("Inicializando PTB + registrando webhook: %s", webhook_url)
 
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status_cmd))
-    application.add_handler(CommandHandler("reset", reset_cmd))
-    application.add_handler(CommandHandler("undo", undo_cmd))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_message))
-
-    # Sobe servidor e registra webhook
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=webhook_path,
-        webhook_url=f"{base_url.rstrip('/')}/{webhook_path}",
-        secret_token=secret_token,
-        drop_pending_updates=True,
+    await application.initialize()
+    # registra webhook no Telegram
+    await application.bot.set_webhook(
+        url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True
     )
+    info = await application.bot.get_webhook_info()
+    log.info("Webhook info: url=%s, has_custom_cert=%s, pending_update_count=%s",
+             info.url, info.has_custom_certificate, info.pending_update_count)
+    if info.last_error_message:
+        log.warning("Último erro do Telegram: %s (há %ss)", info.last_error_message, info.last_error_date)
 
+    # Inicia PTB (necessário para processar updates)
+    await application.start()
+    log.info("Application started (PTB + FastAPI). Path=/%s  Porta=%s", WEBHOOK_PATH, PORT)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    # Remove webhook e para PTB
+    try:
+        await application.bot.delete_webhook()
+    except Exception as e:
+        log.warning("Falha ao deletar webhook: %s", e)
+    await application.stop()
+    await application.shutdown()
+    log.info("Application stopped.")
+
+@app.get("/health", response_class=PlainTextResponse)
+async def health():
+    return "ok"
+
+@app.post(f"/{WEBHOOK_PATH}")
+async def telegram_webhook(request: Request):
+    # Valida header secreto se definido
+    if WEBHOOK_SECRET:
+        secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if secret_header != WEBHOOK_SECRET:
+            # rejeita silenciosamente para não vazar info
+            return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+
+    data = await request.json()
+    try:
+        update = Update.de_json(data, application.bot)
+    except Exception as e:
+        log.warning("Falha ao decodificar update: %s", e)
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+
+    # processa o update (assíncrono)
+    await application.process_update(update)
+    return Response(status_code=status.HTTP_200_OK)
+
+# -----------------------------------------------------------------------------
+# ENTRYPOINT UVICORN
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    # Executa o servidor FastAPI
+    import uvicorn
+    log.info("Subindo Uvicorn em 0.0.0.0:%s ...", PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
