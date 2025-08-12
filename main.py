@@ -36,7 +36,7 @@ app = FastAPI(title="Roulette Double Dozens Bot — Book Style + Gale1", version
 # -----------------------------------------------------------------------------
 SHOW_NOENTRY_RECOMMENDATION = False  # não mostrar recomendação quando decisão for "sem entrada"
 
-MIN_SPINS = 800         # amostra mínima para testar viés (estilo livros)
+MIN_SPINS = 20         # amostra mínima para testar viés (estilo livros)
 P_THRESHOLD = 0.01      # nível de significância aproximado (qui-quadrado, gl=36)
 
 # Ordem física (roda europeia, sentido horário)
