@@ -702,10 +702,8 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_whinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = await application.bot.get_webhook_info()
     await update.message.reply_text(
-        f"Webhook: {info.url or '-'}
-"
-        f"Pendentes: {info.pending_update_count}
-"
+        f"Webhook: {info.url or '-'}\n"
+        f"Pendentes: {info.pending_update_count}\n"
         f"Erro último: {info.last_error_message or '-'}"
     )
 
@@ -724,14 +722,10 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok_redis = False
     # fixed newlines below
     status = (
-        f"🩺 <b>Health</b>
-"
-        f"Webhook: {info.url or '-'}
-"
-        f"Pendentes: {info.pending_update_count}
-"
-        f"Último erro: {info.last_error_message or '-'}
-"
+        f"🩺 <b>Health</b>\n"
+        f"Webhook: {info.url or '-'}\n"
+        f"Pendentes: {info.pending_update_count}\n"
+        f"Último erro: {info.last_error_message or '-'}\n"
         f"Redis: {'ok' if ok_redis else 'falhou'}"
     )
     await send_html(update, status)
@@ -775,13 +769,12 @@ async def root_handler(request: web.Request):
     return web.Response(text="ok")
 
 io.router.add_post(f"/{TG_PATH}", tg_handler)
-io.router.add_post("/payments/webhook", payments_handler)
-io.router.add_get("/health", health_handler)
-io.router.add_get("/", root_handler)
+aio.router.add_post("/payments/webhook", payments_handler)
+aio.router.add_get("/health", health_handler)
+aio.router.add_get("/", root_handler)
 
 async def on_startup(app: web.Application):
-    if (not TELEGRAM_TOKEN) or ("
-" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
+    if (not TELEGRAM_TOKEN) or ("\n" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
         raise RuntimeError("TELEGRAM_TOKEN inválido (vazio, com espaço ou quebra de linha). Corrija nas Environment Variables.")
     print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS}")
     await application.initialize()
@@ -807,8 +800,8 @@ async def on_cleanup(app: web.Application):
     await application.stop()
     await application.shutdown()
 
-io.on_startup.append(on_startup)
-io.on_cleanup.append(on_cleanup)
+aio.on_startup.append(on_startup)
+aio.on_cleanup.append(on_cleanup)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
