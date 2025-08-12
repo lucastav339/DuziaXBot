@@ -33,11 +33,12 @@ SUB_DAYS = int((os.getenv("SUB_DAYS") or "7").strip())
 PAYWALL_OFF = ((os.getenv("PAYWALL_OFF") or "0").strip() == "1")
 
 # ===== Parâmetros da ESTRATÉGIA ULTRA-CONSERVADORA =====
-W = int((os.getenv("STRAT_W") or "36").strip())
-Z_ALPHA = float((os.getenv("STRAT_Z_ALPHA") or "1.96").strip())
-PVAL_MAX = float((os.getenv("STRAT_PVAL_MAX") or "0.05").strip())
-CUSUM_H = float((os.getenv("STRAT_CUSUM_H") or "4").strip())
-P1 = float((os.getenv("STRAT_P1") or "0.433").strip())
+# (você pode sobrescrever via ENV, se quiser)
+W = int((os.getenv("STRAT_W") or "36").strip())                 # janela de análise (reinicia no zero)
+Z_ALPHA = float((os.getenv("STRAT_Z_ALPHA") or "1.96").strip())  # z mínimo
+PVAL_MAX = float((os.getenv("STRAT_PVAL_MAX") or "0.05").strip())# p-valor máx no qui-quadrado (gl=2)
+CUSUM_H = float((os.getenv("STRAT_CUSUM_H") or "4").strip())     # limiar de disparo do CUSUM
+P1 = float((os.getenv("STRAT_P1") or "0.433").strip())           # hipótese de viés p1 (p0+Δ)
 P0 = 1.0/3.0
 
 # UI / limites
@@ -74,8 +75,9 @@ async def _safe_redis(coro, default=None, note=""):
         return default
 
 # =========================
-# ESTADO LOCAL / LOGS
+# ESTADO LOCAL
 # =========================
+# ===== SQLite Logs =====
 LOG_DB_PATH = os.getenv("LOG_DB_PATH", "logs.db").strip()
 
 def _db_conn():
@@ -120,13 +122,14 @@ STATE = {}  # uid -> {hist, pred_queue, stats, last_touch, cusum, bankroll, stak
 def ensure_user(uid: int):
     if uid not in STATE:
         STATE[uid] = {
-            "hist": [],
-            "pred_queue": [],
+            "hist": [],                 # sequência de 'D1'/'D2'/'D3' (zera ao sair 0)
+            "pred_queue": [],          # previsões pendentes (para apuração de acerto)
             "stats": {"hits": 0, "misses": 0, "streak_hit": 0, "streak_miss": 0},
             "last_touch": None,
             "cusum": {"D1": 0.0, "D2": 0.0, "D3": 0.0},
             "bankroll": float(os.getenv("BANKROLL_INIT", "50") or 50),
             "stake": float(os.getenv("STAKE", "1") or 1),
+            "mode": "1d",
         }
 
 # =========================
@@ -159,6 +162,7 @@ def pct(h, m) -> float:
 # =========================
 # MAPEAMENTO / HISTÓRICO
 # =========================
+
 def num_to_duzia(n: int):
     if n == 0:
         return None
@@ -169,6 +173,8 @@ def num_to_duzia(n: int):
     if 25 <= n <= 36:
         return "D3"
     return None
+
+# aceita itens já em 'D1'/'D2'/'D3' ou números crus
 
 def _contagens_duzias(seq):
     c = {"D1": 0, "D2": 0, "D3": 0}
@@ -181,6 +187,7 @@ def _contagens_duzias(seq):
 # =========================
 # FORMATAÇÃO
 # =========================
+
 def fmt_start(uid: int, hits_left: int, trial_max: int) -> str:
     return f"""
 🤖 <b>IA Estratégica — Análise de Dúzias (Ultra)</b>
@@ -196,6 +203,7 @@ def fmt_start(uid: int, hits_left: int, trial_max: int) -> str:
 💡 <i>Dica:</i> Envie números na ordem (ex.: 7 28 25 14). Zero (0) reinicia.
 """.strip()
 
+
 def fmt_paywall(link: str, days: int) -> str:
     return f"""
 💳 <b>Seu teste grátis terminou</b>
@@ -207,6 +215,7 @@ Para continuar usando o <b>Analista de Dúzias</b> por <b>{days} dias</b>:
 
 ➡️ <a href="{esc(link)}">Clique aqui para pagar</a>
 """.strip()
+
 
 def fmt_recommendation(duzias, justificativa, pendentes, hits_left, trial_max, banca, stake):
     dz = " + ".join(f"<b>{d}</b>" for d in duzias)
@@ -222,6 +231,7 @@ def fmt_recommendation(duzias, justificativa, pendentes, hits_left, trial_max, b
 🆓 <b>Teste:</b> {hits_left}/{trial_max} acertos restantes
 ━━━━━━━━━━━━━━━━━━
 """.strip()
+
 
 def fmt_no_recommendation(motivo: str, justificativa: str, hits_left: int, trial_max: int, banca: float):
     return f"""
@@ -289,8 +299,9 @@ async def require_active_or_trial(update: Update) -> bool:
     return False
 
 # =========================
-# ESTATÍSTICA — z, χ², Wilson, CUSUM
+# ESTATÍSTICA — z, χ² (gl=2), Wilson, CUSUM
 # =========================
+
 def _wilson_lower(phat: float, w: int, z: float) -> float:
     if w <= 0:
         return 0.0
@@ -299,18 +310,22 @@ def _wilson_lower(phat: float, w: int, z: float) -> float:
     rad = z * ((phat*(1.0-phat)/w + (z*z)/(4.0*w*w)) ** 0.5)
     return (center - rad) / denom
 
+
 def _chi2_p_gl2(chi2: float) -> float:
+    # gl=2 => p = exp(-chi2/2)
     try:
         import math
-        return math.exp(-chi2/2.0)  # gl=2
+        return math.exp(-chi2/2.0)
     except Exception:
         return 1.0
+
 
 def _window_counts(hist: list[str], w: int):
     window = hist[-w:]
     c = _contagens_duzias(window)
     weff = len(window)
     return window, c, weff
+
 
 def _z_scores(c: dict, w_eff: int):
     import math
@@ -319,12 +334,14 @@ def _z_scores(c: dict, w_eff: int):
     denom = (P0*(1.0-P0)/w_eff) ** 0.5
     return {d: (c[d]/w_eff - P0)/denom for d in ("D1","D2","D3")}
 
+
 def _has_seq_or_3in4(hist: list[str], target: str) -> bool:
     if len(hist) >= 3 and all(d == target for d in hist[-3:]):
         return True
     if len(hist) >= 4 and sum(1 for d in hist[-4:] if d == target) >= 3:
         return True
     return False
+
 
 def _update_cusum(cusum: dict, outcome_duzia: str | None, p1: float = P1) -> dict:
     import math
@@ -336,19 +353,23 @@ def _update_cusum(cusum: dict, outcome_duzia: str | None, p1: float = P1) -> dic
     return out
 
 # =========================
-# NÚCLEO DA ESTRATÉGIA
+# NÚCLEO DA ESTRATÉGIA (Modo 1 dúzia / Modo 2 dúzias)
 # =========================
+
 def decidir_1_duzia(state: dict):
+    """Retorna (ok, duzia, dbg, motivo). Usa filtros: z/Wilson + χ², sequência e CUSUM."""
     hist = state["hist"]
     if not hist:
         return False, None, {}, "Histórico insuficiente"
 
     window, C, weff = _window_counts(hist, W)
     Z = _z_scores(C, weff)
+    # Qui-quadrado
     exp = weff/3.0 if weff>0 else 0.0
     chi2 = sum(((C[d] - exp)**2)/exp for d in ("D1","D2","D3")) if weff>0 else 0.0
     pval = _chi2_p_gl2(chi2)
 
+    # D* = maior z
     d_star = max(("D1","D2","D3"), key=lambda d: Z[d])
     phat_star = (C[d_star]/weff) if weff>0 else 0.0
     wilsonL = _wilson_lower(phat_star, weff, Z_ALPHA)
@@ -366,13 +387,17 @@ def decidir_1_duzia(state: dict):
 
     if stat_ok and seq_ok and cusum_ok:
         return True, d_star, dbg, "Apto"
+
+    # Motivo detalhado
     if not stat_ok:
         return False, None, dbg, "Sem confirmação estatística (z/Wilson + χ²)"
     if not seq_ok:
         return False, None, dbg, "Sem sequência (3 seguidas ou 3 em 4)"
     return False, None, dbg, "CUSUM abaixo do limiar"
 
+
 def decidir_2_duzias(state: dict):
+    """Retorna (ok, duzias_list, dbg, motivo). Critério: χ² significativo + (seq OU cusum) em pelo menos 1 das duas com maior z."""
     hist = state["hist"]
     if not hist:
         return False, [], {}, "Histórico insuficiente"
@@ -386,10 +411,11 @@ def decidir_2_duzias(state: dict):
     orden = sorted(("D1","D2","D3"), key=lambda d: Z[d], reverse=True)
     d1, d2, d3 = orden[0], orden[1], orden[2]
 
+    # Pelo menos uma das duas deve cumprir (seq OU cusum)
     cond_d1 = _has_seq_or_3in4(hist, d1) or (state["cusum"].get(d1,0.0) > CUSUM_H)
     cond_d2 = _has_seq_or_3in4(hist, d2) or (state["cusum"].get(d2,0.0) > CUSUM_H)
 
-    stat_ok = (pval < PVAL_MAX)
+    stat_ok = (pval < PVAL_MAX)  # χ² confirma desequilíbrio global
     any_confirm = (cond_d1 or cond_d2)
 
     dbg = {
@@ -401,6 +427,7 @@ def decidir_2_duzias(state: dict):
 
     if stat_ok and any_confirm:
         return True, [d1, d2], dbg, "Apto"
+
     if not stat_ok:
         return False, [], dbg, "χ² não significativo (p ≥ limiar)"
     return False, [], dbg, "Sem sequência/CUSUM nas candidatas"
@@ -409,6 +436,7 @@ def decidir_2_duzias(state: dict):
 # SCORE / PREVISÕES
 # =========================
 async def score_predictions(uid: int, nums: list[int]) -> bool:
+    """Apura acertos/erros consumindo a fila; retorna True se o trial estourou aqui."""
     st = STATE[uid]
     q = st["pred_queue"]
     s = st["stats"]
@@ -420,8 +448,10 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
     for n in nums:
         d = num_to_duzia(n)
         if d is None:
+            # zero: não apura; apenas continua
             continue
         if not q:
+            # nada a apurar
             continue
         pred = q.pop(0)
         hit = (d in pred.get("duzias", []))
@@ -442,7 +472,7 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
     return hit_limit_now
 
 # =========================
-# COMANDOS
+# HANDLERS — COMANDOS
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
@@ -564,30 +594,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_active_or_trial(update):
         return
 
-    # 3) Atualiza histórico e CUSUM
+    # 3) Atualiza histórico (em dúzias), reseta no zero e atualiza CUSUM
     st = STATE[uid]
     for n in nums:
         d = num_to_duzia(n)
-        if d is None:
+        if d is None:  # zero
             st["hist"] = []
             st["cusum"] = {"D1":0.0, "D2":0.0, "D3":0.0}
         else:
             st["hist"].append(d)
-            st["hist"] = st["hist"][-max(W*5, 200):]
+            st["hist"] = st["hist"][-max(W*5, 200):]  # histórico longo suficiente (capado)
             st["cusum"] = _update_cusum(st["cusum"], d, P1)
 
-    # 4) Decisão (1 dúzia por padrão; 2 dúzias se habilitado fora)
-    mode = st.get("mode", "1d") if "mode" in st else "1d"
+    # 4) Rodar decisão conforme modo do usuário
+    mode = st.get("mode", "1d")
     if mode == "2d":
         ok, duzias, dbg, motivo = decidir_2_duzias(st)
     else:
         ok, d1, dbg, motivo = decidir_1_duzia(st)
         duzias = [d1] if d1 else []
+        dbg = dbg
 
     hits = await get_trial_hits(uid) if rds else 0
     hits_left = max(TRIAL_MAX_HITS - hits, 0)
 
     if not ok:
+        # fixed newlines in justification
         jus = (
             f"Janela efetiva={dbg.get('weff',0)}; Contagens={dbg.get('C')}; z={dbg.get('Z')}; "
             f"χ²={dbg.get('chi2')} (p={dbg.get('p')}); WilsonL={dbg.get('wilsonL', '—')}; "
@@ -599,6 +631,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Registrar previsão pendente
     st["pred_queue"].append({"duzias": duzias})
     pend = len(st["pred_queue"])
+    # log do sinal
     try:
         log_event(uid, kind="signal", number=None, outcome_duzia=None,
                   recommended=",".join(duzias), hit=None,
@@ -625,6 +658,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+# --- Error handler global (evita que o bot 'morra' silenciosamente) ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("[ERROR] Exception no handler", exc_info=context.error)
     try:
@@ -645,6 +679,22 @@ application.add_handler(CommandHandler("stake", cmd_stake))
 application.add_handler(CommandHandler("bank", cmd_bank))
 application.add_handler(CommandHandler("ultra", cmd_ultra))
 
+# /modo 1d|2d — alterna o modo de operação
+async def cmd_modo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user.id)
+    st = STATE[update.effective_user.id]
+    arg = (context.args[0].lower() if context.args else "").strip()
+    if arg in {"1d", "1", "um"}:
+        st["mode"] = "1d"
+        await send_html(update, "✅ Modo definido para <b>1 dúzia</b> (ultra-conservador).")
+    elif arg in {"2d", "2", "dois"}:
+        st["mode"] = "2d"
+        await send_html(update, "✅ Modo definido para <b>2 dúzias</b> (χ² + sequência/CUSUM nas top2).")
+    else:
+        await send_html(update, "Uso: <code>/modo 1d</code> ou <code>/modo 2d</code>.")
+
+application.add_handler(CommandHandler("modo", cmd_modo))
+
 # Debug/saúde
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
@@ -652,14 +702,17 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_whinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = await application.bot.get_webhook_info()
     await update.message.reply_text(
-        f"Webhook: {info.url or '-'}\n"
-        f"Pendentes: {info.pending_update_count}\n"
+        f"Webhook: {info.url or '-'}
+"
+        f"Pendentes: {info.pending_update_count}
+"
         f"Erro último: {info.last_error_message or '-'}"
     )
 
 application.add_handler(CommandHandler("ping", cmd_ping))
 application.add_handler(CommandHandler("whinfo", cmd_whinfo))
 
+# /health: checa Telegram e Redis em tempo real
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = await application.bot.get_webhook_info()
     ok_redis = True
@@ -669,11 +722,16 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok_redis = bool(pong)
         except Exception:
             ok_redis = False
+    # fixed newlines below
     status = (
-        f"🩺 <b>Health</b>\n"
-        f"Webhook: {info.url or '-'}\n"
-        f"Pendentes: {info.pending_update_count}\n"
-        f"Último erro: {info.last_error_message or '-'}\n"
+        f"🩺 <b>Health</b>
+"
+        f"Webhook: {info.url or '-'}
+"
+        f"Pendentes: {info.pending_update_count}
+"
+        f"Último erro: {info.last_error_message or '-'}
+"
         f"Redis: {'ok' if ok_redis else 'falhou'}"
     )
     await send_html(update, status)
@@ -716,18 +774,19 @@ async def health_handler(request: web.Request):
 async def root_handler(request: web.Request):
     return web.Response(text="ok")
 
-# >>> CORRIGIDO: usar 'aio' (não 'io')
-aio.router.add_post(f"/{TG_PATH}", tg_handler)
-aio.router.add_post("/payments/webhook", payments_handler)
-aio.router.add_get("/health", health_handler)
-aio.router.add_get("/", root_handler)
+io.router.add_post(f"/{TG_PATH}", tg_handler)
+io.router.add_post("/payments/webhook", payments_handler)
+io.router.add_get("/health", health_handler)
+io.router.add_get("/", root_handler)
 
 async def on_startup(app: web.Application):
-    if (not TELEGRAM_TOKEN) or ("\n" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
+    if (not TELEGRAM_TOKEN) or ("
+" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
         raise RuntimeError("TELEGRAM_TOKEN inválido (vazio, com espaço ou quebra de linha). Corrija nas Environment Variables.")
     print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS}")
     await application.initialize()
     await application.start()
+    # Garante que só recebemos tipos de atualização que tratamos
     await application.bot.set_my_commands([
         ("start", "iniciar"), ("status", "ver status"), ("reset", "zerar histórico"),
         ("stats", "resultados"), ("stake", "stake"), ("bank", "banca"), ("ultra", "mostrar thresholds"),
@@ -748,8 +807,8 @@ async def on_cleanup(app: web.Application):
     await application.stop()
     await application.shutdown()
 
-aio.on_startup.append(on_startup)
-aio.on_cleanup.append(on_cleanup)
+io.on_startup.append(on_startup)
+io.on_cleanup.append(on_cleanup)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
