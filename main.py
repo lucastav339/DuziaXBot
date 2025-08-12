@@ -18,7 +18,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
+from telegram.request import AiohttpSession
 
 # =========================
 # CONFIG / ENV
@@ -33,11 +34,11 @@ SUB_DAYS = int((os.getenv("SUB_DAYS") or "7").strip())
 PAYWALL_OFF = ((os.getenv("PAYWALL_OFF") or "0").strip() == "1")
 
 # ===== Parâmetros da ESTRATÉGIA ULTRA-CONSERVADORA =====
-W = int((os.getenv("STRAT_W") or "36").strip())                  # janela de análise (reinicia no zero)
+W = int((os.getenv("STRAT_W") or "36").strip())                  # janela de análise
 Z_ALPHA = float((os.getenv("STRAT_Z_ALPHA") or "1.96").strip())  # z mínimo
-PVAL_MAX = float((os.getenv("STRAT_PVAL_MAX") or "0.05").strip())# p-valor máx no qui-quadrado (gl=2)
-CUSUM_H = float((os.getenv("STRAT_CUSUM_H") or "4").strip())     # limiar de disparo do CUSUM
-P1 = float((os.getenv("STRAT_P1") or "0.433").strip())           # hipótese de viés p1 (p0+Δ)
+PVAL_MAX = float((os.getenv("STRAT_PVAL_MAX") or "0.05").strip())# p-valor máx no χ² (gl=2)
+CUSUM_H = float((os.getenv("STRAT_CUSUM_H") or "4").strip())     # limiar CUSUM
+P1 = float((os.getenv("STRAT_P1") or "0.433").strip())           # hipótese de viés p1
 P0 = 1.0/3.0
 
 # UI / limites
@@ -114,7 +115,7 @@ def log_event(chat_id:int, kind:str, number:int|None=None, outcome_duzia:str|Non
     except Exception as e:
         log.error(f"[LOG] Falha ao gravar log: {e}")
 
-# STATE mantém histórico em DÚZIAS ("D1","D2","D3").
+# STATE mantém histórico em DÚZIAS
 STATE = {}  # uid -> {hist, pred_queue, stats, last_touch, cusum, bankroll, stake, mode}
 
 def ensure_user(uid: int):
@@ -297,7 +298,7 @@ def _wilson_lower(phat: float, w: int, z: float) -> float:
         return 0.0
     denom = 1.0 + (z*z)/w
     center = phat + (z*z)/(2.0*w)
-    rad = z * ((phat*(1.0-phat)/w + (z*z)/(4.0*w*w)) ** 0.5)
+    rad = z * ((phat*(1.0-phat)/w + (z*z)/(4.0/w**2)) ** 0.5) if w > 0 else 0.0
     return (center - rad) / denom
 
 def _chi2_p_gl2(chi2: float) -> float:
@@ -590,7 +591,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["hist"] = st["hist"][-max(W*5, 200):]
             st["cusum"] = _update_cusum(st["cusum"], d, P1)
 
-    # 4) Decisão (1 dúzia por padrão; 2 dúzias se modo=2d)
+    # 4) Decisão
     mode = st.get("mode", "1d")
     if mode == "2d":
         ok, duzias, dbg, motivo = decidir_2_duzias(st)
@@ -637,7 +638,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # AIOHTTP + TELEGRAM (WEBHOOK)
 # =========================
-application = Application.builder().token(TELEGRAM_TOKEN).build()
+# Sessão com timeouts (evita TimedOut derrubar o app)
+REQUEST = AiohttpSession(
+    connect_timeout=10,
+    read_timeout=30,
+    write_timeout=30,
+    pool_timeout=10,
+)
+
+application = Application.builder().token(TELEGRAM_TOKEN).request(REQUEST).build()
 
 # Error handler global
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -666,18 +675,26 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
 async def cmd_whinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    info = await application.bot.get_webhook_info()
-    await update.message.reply_text(
-        f"Webhook: {info.url or '-'}\n"
-        f"Pendentes: {info.pending_update_count}\n"
-        f"Erro último: {info.last_error_message or '-'}"
-    )
+    try:
+        info = await application.bot.get_webhook_info()
+        await update.message.reply_text(
+            f"Webhook: {info.url or '-'}\n"
+            f"Pendentes: {info.pending_update_count}\n"
+            f"Erro último: {info.last_error_message or '-'}"
+        )
+    except TimedOut:
+        await update.message.reply_text("get_webhook_info: Timeout. Tente novamente.")
 
 application.add_handler(CommandHandler("ping", cmd_ping))
 application.add_handler(CommandHandler("whinfo", cmd_whinfo))
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    info = await application.bot.get_webhook_info()
+    try:
+        info = await application.bot.get_webhook_info()
+    except TimedOut:
+        await send_html(update, "🩺 <b>Health</b>\nWebhook: timeout ao consultar o Telegram")
+        return
+
     ok_redis = True
     if rds:
         try:
@@ -732,7 +749,7 @@ async def health_handler(request: web.Request):
 async def root_handler(request: web.Request):
     return web.Response(text="ok")
 
-# Rotas (usar 'aio', não 'io')
+# Rotas (usar 'aio')
 aio.router.add_post(f"/{TG_PATH}", tg_handler)
 aio.router.add_post("/payments/webhook", payments_handler)
 aio.router.add_get("/health", health_handler)
@@ -751,8 +768,11 @@ async def on_startup(app: web.Application):
     ])
     if PUBLIC_URL:
         hook_url = f"{PUBLIC_URL}/{TG_PATH}"
-        await application.bot.set_webhook(url=hook_url, drop_pending_updates=True, allowed_updates=["message"])
-        print(f"✅ Webhook setado em {hook_url}")
+        try:
+            await application.bot.set_webhook(url=hook_url, drop_pending_updates=True, allowed_updates=["message"])
+            print(f"✅ Webhook setado em {hook_url}")
+        except TimedOut:
+            print("⚠️ set_webhook: timeout — seguindo sem travar. Tente /whinfo depois.")
     else:
         print("⚠️ Defina PUBLIC_URL para habilitar o webhook.")
 
