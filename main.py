@@ -619,8 +619,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not ok:
         jus = (
-            f"Janela efetiva={dbg.get('weff',0)}; Contagens={dbg.get('C')}; z={dbg.get('Z')}
-"
+            f"Janela efetiva={dbg.get('weff',0)}; Contagens={dbg.get('C')}; z={dbg.get('Z')}; "
             f"χ²={dbg.get('chi2')} (p={dbg.get('p')}); WilsonL={dbg.get('wilsonL', '—')}; "
             f"CUSUM={dbg.get('cusum')}; Extra={dbg.get('top2', '') or dbg.get('d*', '')}"
         )
@@ -685,9 +684,9 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_whinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = await application.bot.get_webhook_info()
     await update.message.reply_text(
-        f"Webhook: {info.url or '-'}
-Pendentes: {info.pending_update_count}
-Erro último: {info.last_error_message or '-'}"
+        f"Webhook: {info.url or '-'}\n"
+        f"Pendentes: {info.pending_update_count}\n"
+        f"Erro último: {info.last_error_message or '-'}"
     )
 
 application.add_handler(CommandHandler("ping", cmd_ping))
@@ -704,14 +703,10 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             ok_redis = False
     status = (
-        f"🩺 <b>Health</b>
-"
-        f"Webhook: {info.url or '-'}
-"
-        f"Pendentes: {info.pending_update_count}
-"
-        f"Último erro: {info.last_error_message or '-'}
-"
+        f"🩺 <b>Health</b>\n"
+        f"Webhook: {info.url or '-'}\n"
+        f"Pendentes: {info.pending_update_count}\n"
+        f"Último erro: {info.last_error_message or '-'}\n"
         f"Redis: {'ok' if ok_redis else 'falhou'}"
     )
     await send_html(update, status)
@@ -760,8 +755,7 @@ io.router.add_get("/health", health_handler)
 io.router.add_get("/", root_handler)
 
 async def on_startup(app: web.Application):
-    if (not TELEGRAM_TOKEN) or ("
-" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
+    if (not TELEGRAM_TOKEN) or ("\n" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
         raise RuntimeError("TELEGRAM_TOKEN inválido (vazio, com espaço ou quebra de linha). Corrija nas Environment Variables.")
     print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS}")
     await application.initialize()
