@@ -7,6 +7,7 @@ from html import escape as esc
 
 from aiohttp import web
 import redis.asyncio as redis
+import sqlite3
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -76,6 +77,45 @@ async def _safe_redis(coro, default=None, note=""):
 # =========================
 # ESTADO LOCAL
 # =========================
+# ===== SQLite Logs =====
+LOG_DB_PATH = os.getenv("LOG_DB_PATH", "logs.db").strip()
+
+def _db_conn():
+    conn = sqlite3.connect(LOG_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,          -- 'signal' | 'settle' | 'error'
+            number INTEGER,
+            outcome_duzia TEXT,
+            recommended TEXT,
+            hit INTEGER,
+            bankroll REAL,
+            stake REAL,
+            meta TEXT
+        );
+        """
+    )
+    return conn
+
+def log_event(chat_id:int, kind:str, number:int|None=None, outcome_duzia:str|None=None,
+              recommended:str|None=None, hit:int|None=None, bankroll:float|None=None,
+              stake:float|None=None, meta:str|None=None):
+    try:
+        conn = _db_conn()
+        conn.execute(
+            "INSERT INTO logs (ts,chat_id,kind,number,outcome_duzia,recommended,hit,bankroll,stake,meta) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (datetime.datetime.utcnow().isoformat(), chat_id, kind, number, outcome_duzia, recommended, hit,
+             bankroll, stake, meta)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"[LOG] Falha ao gravar log: {e}")
+
 # STATE mantém histórico em DÚZIAS ("D1","D2","D3").
 STATE = {}  # uid -> {hist, pred_queue, stats, last_touch, cusum, bankroll, stake}
 
@@ -408,7 +448,7 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
         d = num_to_duzia(n)
         if d is None:
             # zero: não apura; apenas continua
-            pass
+            continue
         if not q:
             # nada a apurar
             continue
@@ -416,12 +456,18 @@ async def score_predictions(uid: int, nums: list[int]) -> bool:
         hit = (d in pred.get("duzias", []))
         if hit:
             s["hits"] += 1; s["streak_hit"] += 1; s["streak_miss"] = 0
+            log_event(uid, kind="settle", number=n, outcome_duzia=d,
+                      recommended=",".join(pred.get("duzias", [])), hit=1,
+                      bankroll=STATE[uid]["bankroll"], stake=STATE[uid]["stake"])
             if on_trial and TRIAL_MAX_HITS > 0:
                 new_hits = await _safe_redis(incr_trial_hits(uid, 1), default=0, note="incr_trial_hits")
                 if new_hits >= TRIAL_MAX_HITS:
                     hit_limit_now = True
         else:
             s["misses"] += 1; s["streak_miss"] += 1; s["streak_hit"] = 0
+            log_event(uid, kind="settle", number=n, outcome_duzia=d,
+                      recommended=",".join(pred.get("duzias", [])), hit=0,
+                      bankroll=STATE[uid]["bankroll"], stake=STATE[uid]["stake"])
     return hit_limit_now
 
 # =========================
@@ -559,36 +605,68 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["hist"] = st["hist"][-max(W*5, 200):]  # histórico longo suficiente (capado)
             st["cusum"] = _update_cusum(st["cusum"], d, P1)
 
-    # 4) Rodar decisão (modo 1 dúzia por padrão). Quer 2 dúzias? Altere abaixo ou crie comando.
-    ok1, d1, dbg1, motivo1 = decidir_1_duzia(st)
+    # 4) Rodar decisão conforme modo do usuário
+    mode = st.get("mode", "1d")
+    if mode == "2d":
+        ok, duzias, dbg, motivo = decidir_2_duzias(st)
+    else:
+        ok, d1, dbg, motivo = decidir_1_duzia(st)
+        duzias = [d1] if d1 else []
+        dbg = dbg
 
     hits = await get_trial_hits(uid) if rds else 0
     hits_left = max(TRIAL_MAX_HITS - hits, 0)
 
-    if not ok1:
-        # mensagem técnica
+    if not ok:
         jus = (
-            f"Janela efetiva={dbg1.get('weff',0)}; Contagens={dbg1.get('C')}; z={dbg1.get('Z')}\n"
-            f"χ²={dbg1.get('chi2')} (p={dbg1.get('p')}); WilsonL={dbg1.get('wilsonL')}; "
-            f"CUSUM={dbg1.get('cusum')}; Seq={dbg1.get('seq')}"
+            f"Janela efetiva={dbg.get('weff',0)}; Contagens={dbg.get('C')}; z={dbg.get('Z')}
+"
+            f"χ²={dbg.get('chi2')} (p={dbg.get('p')}); WilsonL={dbg.get('wilsonL', '—')}; "
+            f"CUSUM={dbg.get('cusum')}; Extra={dbg.get('top2', '') or dbg.get('d*', '')}"
         )
-        await send_html(update, fmt_no_recommendation(motivo1, jus, hits_left, TRIAL_MAX_HITS, st["bankroll"]))
+        await send_html(update, fmt_no_recommendation(motivo, jus, hits_left, TRIAL_MAX_HITS, st["bankroll"]))
         return
 
-    # Registrar previsão pendente: apostar na dúzia d1 no próximo giro
-    st["pred_queue"].append({"duzias": [d1]})
+    # Registrar previsão pendente
+    st["pred_queue"].append({"duzias": duzias})
     pend = len(st["pred_queue"])
+    # log do sinal
+    try:
+        log_event(uid, kind="signal", number=None, outcome_duzia=None,
+                  recommended=",".join(duzias), hit=None,
+                  bankroll=st["bankroll"], stake=st["stake"], meta=str(dbg))
+    except Exception:
+        pass
 
-    jus = (
-        f"D*={d1} com z={dbg1['Z'][d1]:.3f}; χ²={dbg1['chi2']} (p={dbg1['p']}). "
-        f"WilsonL={dbg1['wilsonL']}; Seq={dbg1['seq']}; CUSUM={dbg1['cusum'][d1]:.3f}"
-    )
-    await send_html(update, fmt_recommendation([d1], jus, pend, hits_left, TRIAL_MAX_HITS, st["bankroll"], st["stake"]))
+    if mode == "2d":
+        jus = (
+            f"Top2={dbg['top2']} com χ²={dbg['chi2']} (p={dbg['p']}). "
+            f"CUSUM={dbg['cusum']} | Cond1={dbg['d1_seq/cusum']} Cond2={dbg['d2_seq/cusum']}"
+        )
+    else:
+        d1 = duzias[0]
+        jus = (
+            f"D*={d1} com z={dbg['Z'][d1]:.3f}; χ²={dbg['chi2']} (p={dbg['p']}). "
+            f"WilsonL={dbg['wilsonL']}; Seq={dbg['seq']}; CUSUM={dbg['cusum'][d1]:.3f}"
+        )
+
+    await send_html(update, fmt_recommendation(duzias, jus, pend, hits_left, TRIAL_MAX_HITS, st["bankroll"], st["stake"]))
 
 # =========================
 # AIOHTTP + TELEGRAM (WEBHOOK)
 # =========================
 application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# --- Error handler global (evita que o bot 'morra' silenciosamente) ---
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("[ERROR] Exception no handler", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("⚠️ Ocorreu um erro interno. Tentando recuperar…")
+    except Exception:
+        pass
+
+application.add_error_handler(error_handler)
 
 # Comandos
 application.add_handler(CommandHandler("start", cmd_start))
@@ -600,6 +678,46 @@ application.add_handler(CommandHandler("stake", cmd_stake))
 application.add_handler(CommandHandler("bank", cmd_bank))
 application.add_handler(CommandHandler("ultra", cmd_ultra))
 
+# Debug/saúde
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")
+
+async def cmd_whinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = await application.bot.get_webhook_info()
+    await update.message.reply_text(
+        f"Webhook: {info.url or '-'}
+Pendentes: {info.pending_update_count}
+Erro último: {info.last_error_message or '-'}"
+    )
+
+application.add_handler(CommandHandler("ping", cmd_ping))
+application.add_handler(CommandHandler("whinfo", cmd_whinfo))
+
+# /health: checa Telegram e Redis em tempo real
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = await application.bot.get_webhook_info()
+    ok_redis = True
+    if rds:
+        try:
+            pong = await rds.ping()
+            ok_redis = bool(pong)
+        except Exception:
+            ok_redis = False
+    status = (
+        f"🩺 <b>Health</b>
+"
+        f"Webhook: {info.url or '-'}
+"
+        f"Pendentes: {info.pending_update_count}
+"
+        f"Último erro: {info.last_error_message or '-'}
+"
+        f"Redis: {'ok' if ok_redis else 'falhou'}"
+    )
+    await send_html(update, status)
+
+application.add_handler(CommandHandler("health", cmd_health))
+
 # Texto
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -607,13 +725,23 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_t
 aio = web.Application()
 
 async def tg_handler(request: web.Request):
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(text="bad json", status=400)
+    try:
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+    except Exception as e:
+        log.exception(f"[TG_HANDLER] Falha ao processar update: {e}")
+        return web.Response(text="error", status=500)
     return web.Response(text="ok")
 
 async def payments_handler(request: web.Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "err": "bad json"}, status=400)
     if data.get("status") == "paid" and "user_id" in data:
         uid = int(data["user_id"])
         dt = await set_active_days(uid, SUB_DAYS)
@@ -626,20 +754,27 @@ async def health_handler(request: web.Request):
 async def root_handler(request: web.Request):
     return web.Response(text="ok")
 
-aio.router.add_post(f"/{TG_PATH}", tg_handler)
-aio.router.add_post("/payments/webhook", payments_handler)
-aio.router.add_get("/health", health_handler)
-aio.router.add_get("/", root_handler)
+io.router.add_post(f"/{TG_PATH}", tg_handler)
+io.router.add_post("/payments/webhook", payments_handler)
+io.router.add_get("/health", health_handler)
+io.router.add_get("/", root_handler)
 
 async def on_startup(app: web.Application):
-    if (not TELEGRAM_TOKEN) or ("\n" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
+    if (not TELEGRAM_TOKEN) or ("
+" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
         raise RuntimeError("TELEGRAM_TOKEN inválido (vazio, com espaço ou quebra de linha). Corrija nas Environment Variables.")
     print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS}")
     await application.initialize()
     await application.start()
+    # Garante que só recebemos tipos de atualização que tratamos
+    await application.bot.set_my_commands([
+        ("start", "iniciar"), ("status", "ver status"), ("reset", "zerar histórico"),
+        ("stats", "resultados"), ("stake", "stake"), ("bank", "banca"), ("ultra", "mostrar thresholds"),
+        ("ping", "teste"), ("whinfo", "webhook info"), ("health", "checar saúde")
+    ])
     if PUBLIC_URL:
         hook_url = f"{PUBLIC_URL}/{TG_PATH}"
-        await application.bot.set_webhook(url=hook_url, drop_pending_updates=True)
+        await application.bot.set_webhook(url=hook_url, drop_pending_updates=True, allowed_updates=["message"])
         print(f"✅ Webhook setado em {hook_url}")
     else:
         print("⚠️ Defina PUBLIC_URL para habilitar o webhook.")
@@ -652,8 +787,8 @@ async def on_cleanup(app: web.Application):
     await application.stop()
     await application.shutdown()
 
-aio.on_startup.append(on_startup)
-aio.on_cleanup.append(on_cleanup)
+io.on_startup.append(on_startup)
+io.on_cleanup.append(on_cleanup)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
