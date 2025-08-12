@@ -29,7 +29,7 @@ log.info("Starting build: %s", BUILD_TAG)
 # -----------------------------------------------------------------------------
 # CONSTANTES (estilo livro)
 # -----------------------------------------------------------------------------
-MIN_SPINS = 800         # amostra mínima para testar viés
+MIN_SPINS = 15         # amostra mínima para testar viés
 P_THRESHOLD = 0.01      # nível de significância aproximado (qui-quadrado, gl=36)
 
 # Ordem física (roda europeia, sentido horário)
