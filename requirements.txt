@@ -1,1 +1,8 @@
+# Biblioteca principal do bot + suporte a webhooks
 python-telegram-bot[webhooks]==21.6
+
+# Para o servidor HTTP interno (instalado com [webhooks], mas deixo explícito para evitar problemas de compatibilidade)
+aiohttp>=3.9.0
+
+# Utilitários padrão
+regex>=2023.12.25
