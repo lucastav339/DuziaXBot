@@ -3,12 +3,14 @@ import os
 import re
 import logging
 import secrets
+from html import escape as esc
 from typing import Dict, Any, List, Tuple
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import PlainTextResponse
 
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
@@ -85,7 +87,7 @@ def pick_two_dozens_auto(history: List[int]) -> Tuple[str, str, str, bool]:
 def bet_header(d1: str, d2: str, excl: str) -> str:
     ev_pct = -EV_POR_STAKE * 100.0  # valor positivo para exibição (~2,70%)
     return (
-        f"🎯 *Recomendação*: {d1} + {d2}  |  🚫 *Excluída*: {excl}\n"
+        f"🎯 <b>Recomendação</b>: {esc(d1)} + {esc(d2)}  |  🚫 <b>Excluída</b>: {esc(excl)}\n"
         f"📈 Prob. teórica: ~64,86%  |  🧮 EV teórico: ~{ev_pct:.2f}% contra o apostador"
     )
 
@@ -93,7 +95,7 @@ def status_text(s: Dict[str, Any]) -> str:
     total = s["wins"] + s["losses"]
     hit = (s["wins"] / total * 100) if total > 0 else 0.0
     return (
-        "📊 *Status*\n"
+        "📊 <b>Status</b>\n"
         f"• Acertos: {s['wins']}  |  Erros: {s['losses']}  |  Taxa de acerto: {hit:.1f}%\n"
         f"• Giros lidos (com entrada): {total}\n"
         "• Janela de tendência: últimos 12 giros"
@@ -114,8 +116,8 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
         return (
             f"{header}\n"
             "— — —\n"
-            f"🛑 Zero recente detectado. *Evite entrada nesta rodada.*\n"
-            f"🎲 Resultado informado: *{number}* ({'zero' if number == 0 else dz})\n"
+            f"🛑 Zero recente detectado. <b>Evite entrada nesta rodada.</b>\n"
+            f"🎲 Resultado informado: <b>{number}</b> ({'zero' if number == 0 else dz})\n"
             f"{status_text(s)}"
         )
 
@@ -123,11 +125,11 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
     if dz in {d1, d2}:
         s["wins"] += 1
         outcome = "win"
-        line = f"✅ *Vitória* — saiu {number} ({dz})."
+        line = f"✅ <b>Vitória</b> — saiu {number} ({dz})."
     else:
         s["losses"] += 1
         outcome = "loss"
-        line = f"❌ *Derrota* — saiu {number} ({'zero' if number == 0 else dz})."
+        line = f"❌ <b>Derrota</b> — saiu {number} ({'zero' if number == 0 else dz})."
 
     s["events"].append({
         "number": number, "dz": dz, "blocked": False, "outcome": outcome,
@@ -138,7 +140,7 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
     return (
         f"{header}\n"
         "— — —\n"
-        f"🎲 Resultado: *{number}*  |  {line}\n"
+        f"🎲 Resultado: <b>{number}</b>  |  {line}\n"
         f"{status_text(s)}"
     )
 
@@ -157,7 +159,7 @@ def apply_undo(s: Dict[str, Any]) -> str:
 
     dz = dozen_of(last_num)
     return (
-        f"↩️ *Undo feito*\n"
+        "↩️ <b>Undo feito</b>\n"
         f"• Removido: {last_num} ({'zero' if last_num == 0 else dz})\n"
         f"{status_text(s)}"
     )
@@ -168,19 +170,19 @@ def apply_undo(s: Dict[str, Any]) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_state(update.effective_chat.id)
     text = (
-        "🤖 *Bot de Roleta — Duas Dúzias* (Webhook/FastAPI)\n"
+        "🤖 <b>Bot de Roleta — Duas Dúzias</b> (Webhook/FastAPI)\n"
         "• Envie o número que saiu (0–36) e eu recomendo as duas dúzias.\n"
         "• Evito entrada quando o zero apareceu nos últimos 2 giros.\n\n"
-        "*Comandos:*\n"
+        "<b>Comandos:</b>\n"
         "/status — mostra acertos/erros\n"
         "/reset — zera histórico\n"
         "/undo — desfaz o último giro"
     )
-    await update.message.reply_markdown_v2(text)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_state(update.effective_chat.id)
-    await update.message.reply_markdown_v2(status_text(s))
+    await update.message.reply_text(status_text(s), parse_mode=ParseMode.HTML)
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_state(update.effective_chat.id)
@@ -192,8 +194,8 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_state(update.effective_chat.id)
-    resp = apply_undo(s).replace("-", r"\-")
-    await update.message.reply_markdown_v2(resp)
+    resp = apply_undo(s)
+    await update.message.reply_text(resp, parse_mode=ParseMode.HTML)
 
 async def on_number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_state(update.effective_chat.id)
@@ -206,8 +208,8 @@ async def on_number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (0 <= n <= 36):
         await update.message.reply_text("Número fora do intervalo. Use 0 a 36.")
         return
-    resp = apply_spin(s, n).replace("-", r"\-")
-    await update.message.reply_markdown_v2(resp)
+    resp = apply_spin(s, n)
+    await update.message.reply_text(resp, parse_mode=ParseMode.HTML)
 
 # -----------------------------------------------------------------------------
 # APP FASTAPI + INTEGRAÇÃO PTB
@@ -299,7 +301,6 @@ async def telegram_webhook(request: Request):
 # ENTRYPOINT UVICORN
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Executa o servidor FastAPI
     import uvicorn
     log.info("Subindo Uvicorn em 0.0.0.0:%s ...", PORT)
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
