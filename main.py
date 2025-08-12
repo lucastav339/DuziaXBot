@@ -1,4 +1,7 @@
+# main.py
 import os
+import re
+import logging
 import secrets
 from typing import Dict, Any, List, Tuple
 from telegram import Update
@@ -6,11 +9,19 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# -----------------------------
-# Estado por chat (em memória)
-# -----------------------------
-STATE: Dict[int, Dict[str, Any]] = {}
+# ──────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("roulette-bot")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# ESTADO EM MEMÓRIA
+# ──────────────────────────────────────────────────────────────────────────────
+STATE: Dict[int, Dict[str, Any]] = {}
 DEFAULTS = {
     "history": [],   # sequência de números informados
     "wins": 0,
@@ -18,11 +29,15 @@ DEFAULTS = {
     "events": [],    # log por giro: dict(number, dz, blocked, outcome: 'win'|'loss'|'skip')
 }
 
-# Probabilidades (roleta europeia 37 números) — referência matemática
+# Probabilidades (roleta europeia 37 números): referência matemática
 P_VITORIA = 24 / 37
 P_DERROTA = 1 - P_VITORIA
-EV_POR_STAKE = P_VITORIA * (+1) + P_DERROTA * (-2)  # ~ -0,02703 (−2,703%) por rodada (duas dúzias)
+# EV teórico por rodada (duas dúzias) em "unidades de stake" (apenas referência informativa)
+EV_POR_STAKE = P_VITORIA * (+1) + P_DERROTA * (-2)  # ≈ -0.02703 (−2.703%)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# FUNÇÕES DE NEGÓCIO
+# ──────────────────────────────────────────────────────────────────────────────
 def get_state(chat_id: int) -> Dict[str, Any]:
     if chat_id not in STATE:
         STATE[chat_id] = {k: (v.copy() if isinstance(v, list) else v) for k, v in DEFAULTS.items()}
@@ -72,7 +87,7 @@ def bet_header(d1: str, d2: str, excl: str) -> str:
 
 def status_text(s: Dict[str, Any]) -> str:
     total = s["wins"] + s["losses"]
-    hit = (s["wins"]/total*100) if total > 0 else 0.0
+    hit = (s["wins"] / total * 100) if total > 0 else 0.0
     return (
         "📊 *Status*\n"
         f"• Acertos: {s['wins']}  |  Erros: {s['losses']}  |  Taxa de acerto: {hit:.1f}%\n"
@@ -96,7 +111,7 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
             f"{header}\n"
             "— — —\n"
             f"🛑 Zero recente detectado. *Evite entrada nesta rodada.*\n"
-            f"🎲 Resultado informado: *{number}* ({'zero' if number==0 else dz})\n"
+            f"🎲 Resultado informado: *{number}* ({'zero' if number == 0 else dz})\n"
             f"{status_text(s)}"
         )
 
@@ -108,7 +123,7 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
     else:
         s["losses"] += 1
         outcome = "loss"
-        line = f"❌ *Derrota* — saiu {number} ({'zero' if number==0 else dz})."
+        line = f"❌ *Derrota* — saiu {number} ({'zero' if number == 0 else dz})."
 
     s["events"].append({
         "number": number, "dz": dz, "blocked": False, "outcome": outcome,
@@ -126,7 +141,6 @@ def apply_spin(s: Dict[str, Any], number: int) -> str:
 def apply_undo(s: Dict[str, Any]) -> str:
     if not s["history"]:
         return "Nada para desfazer."
-
     last_num = s["history"].pop()
     last_event = s["events"].pop() if s["events"] else None
 
@@ -140,13 +154,13 @@ def apply_undo(s: Dict[str, Any]) -> str:
     dz = dozen_of(last_num)
     return (
         f"↩️ *Undo feito*\n"
-        f"• Removido: {last_num} ({'zero' if last_num==0 else dz})\n"
+        f"• Removido: {last_num} ({'zero' if last_num == 0 else dz})\n"
         f"{status_text(s)}"
     )
 
-# -----------------------------
-# Handlers do bot
-# -----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# HANDLERS
+# ──────────────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_state(update.effective_chat.id)
     text = (
@@ -180,38 +194,46 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_state(update.effective_chat.id)
     text = (update.message.text or "").strip()
-
-    import re
     m = re.search(r"(?<!\d)(\d{1,2})(?!\d)", text)
     if not m:
         await update.message.reply_text("Envie um número entre 0 e 36. Use /undo para desfazer o último giro.")
         return
-
     n = int(m.group(1))
     if not (0 <= n <= 36):
         await update.message.reply_text("Número fora do intervalo. Use 0 a 36.")
         return
-
-    resp = apply_spin(s, n)
-    resp = resp.replace("-", r"\-")
+    resp = apply_spin(s, n).replace("-", r"\-")
     await update.message.reply_markdown_v2(resp)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN (WEBHOOK)
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Defina a variável de ambiente BOT_TOKEN com o token do BotFather.")
 
-    # URL pública do serviço
     base_url = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if not base_url:
-        raise RuntimeError("Defina PUBLIC_URL (ou use RENDER_EXTERNAL_URL do Render) para registrar o webhook.")
+        raise RuntimeError("Defina PUBLIC_URL (ou deixe o Render expor RENDER_EXTERNAL_URL).")
 
-    # Porta fornecida pelo Render
     port = int(os.getenv("PORT", "10000"))
-    # Caminho secreto do webhook (evite expor o token). Pode setar WEBHOOK_PATH manualmente se quiser.
     webhook_path = os.getenv("WEBHOOK_PATH") or secrets.token_urlsafe(32)
-    # Token secreto do header do Telegram (opcional, mas recomendado)
-    secret_token = os.getenv("WEBHOOK_SECRET")
+    secret_token = os.getenv("WEBHOOK_SECRET")  # opcional, mas recomendado
+
+    log.info("Iniciando bot (PTB webhook)…")
+    log.info("PTB versão: tentando importar…")
+    try:
+        import telegram
+        log.info("python-telegram-bot: %s", getattr(telegram, "__version__", "desconhecida"))
+    except Exception as e:
+        log.warning("Falha ao obter versão do PTB: %s", e)
+
+    log.info("Config webhook:")
+    log.info("  URL base: %s", base_url)
+    log.info("  Porta: %s", port)
+    log.info("  Path: /%s", webhook_path)
+    log.info("  Secret token definido? %s", "sim" if secret_token else "não")
 
     application = Application.builder().token(token).build()
 
@@ -222,7 +244,7 @@ def main():
     application.add_handler(CommandHandler("undo", undo_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_message))
 
-    # Inicia servidor webhook embutido (aiohttp) e registra URL no Telegram
+    # Sobe servidor e registra webhook
     application.run_webhook(
         listen="0.0.0.0",
         port=port,
