@@ -44,7 +44,7 @@ ptb_app: Optional[Application] = None
 # Simulação de IA (sem mudar seu design)
 # =========================
 IA_MODE = True          # liga/desliga a simulação
-IA_ADD_HEADER = False   # cabeçalho/rodapé sutis (False = não altera visual)
+IA_ADD_HEADER = False   # True = adiciona cabeçalho/rodapé sutil; False = visual 100% igual ao seu
 
 IA_NAME = "Oráculo IA"
 IA_TAGLINE = "Análise adaptativa"
@@ -148,12 +148,7 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
         # Correção
         "awaiting_correction": False,
         "last_input": None,
-        "last_closure": {
-            "had": False,
-            "was_win": False,
-            "prev_pending": None,
-            "prev_streak": 0,
-        },
+        "last_closure": {"had": False, "was_win": False, "prev_pending": None, "prev_streak": 0},
         "last_entry_basis": {"kind": None},  # "book" | "quick" | None
         "last_just_entry_idx": -1,
         "last_just_error_idx": -1,
@@ -218,11 +213,7 @@ def last_k_dozens(state: Dict[str, Any], k: int) -> List[str]:
     seq = list(state["history"])[-k:]
     return [dozen_of(x) for x in seq if 0 <= x <= 36 and dozen_of(x) is not None]
 
-def quick_edge_two_dozens(
-    state: Dict[str, Any],
-    k: int = 12,
-    need: int = 7
-) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
+def quick_edge_two_dozens(state: Dict[str, Any], k: int = 12, need: int = 7) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
     dzs = last_k_dozens(state, k)
     if len(dzs) < k:
         return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente", {"D1":0,"D2":0,"D3":0})
@@ -236,11 +227,7 @@ def quick_edge_two_dozens(
         return (True, (d1,d2,excl), f"curto-prazo: {c[d1]}+{c[d2]} em {k}", c)
     return (False, ("D1","D2","D3"), f"curto-prazo insuficiente: {c[d1]}+{c[d2]}<{need}", c)
 
-def should_enter_book_style(
-    state: Dict[str, Any],
-    min_spins: int,
-    p_threshold: float
-) -> Tuple[bool, str, Tuple[str,str,str]]:
+def should_enter_book_style(state: Dict[str, Any], min_spins: int, p_threshold: float) -> Tuple[bool, str, Tuple[str,str,str]]:
     total = state.get("total_spins", 0)
     if total < min_spins:
         return (False, f"amostra insuficiente ({total}/{min_spins})", ("D1","D2","D3"))
@@ -472,12 +459,7 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dz = dozen_of(n)
         s["bets"] += 1
         was_win = (dz in (d1p, d2p))
-        s["last_closure"] = {
-            "had": True,
-            "was_win": was_win,
-            "prev_pending": prev_pending,
-            "prev_streak": s.get("win_streak", 0),
-        }
+        s["last_closure"] = {"had": True, "was_win": was_win, "prev_pending": prev_pending, "prev_streak": s.get("win_streak", 0)}
         if was_win:
             s["wins"] += 1
             s["win_streak"] = s.get("win_streak", 0) + 1
