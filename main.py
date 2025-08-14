@@ -36,11 +36,11 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.8.0")
+app = FastAPI(title="Roulette Signals Bot", version="1.8.1")
 ptb_app: Optional[Application] = None
 
 # =========================
-# “Justificativas” aleatórias
+# “Justificativas” aleatórias (entrada/erro) sem repetição consecutiva
 # =========================
 JUSTIFICATIVAS_ENTRADA = [
     "Padrão de repetição detectado nas últimas ocorrências, favorecendo essa combinação.",
@@ -75,7 +75,6 @@ def pick_no_repeat(pool: List[str], last_idx: int) -> Tuple[str, int]:
     if len(pool) == 1:
         return pool[0], 0
     idx = last_idx
-    # tenta até ser diferente (em listas pequenas é O(1) na prática)
     while idx == last_idx:
         idx = random.randrange(len(pool))
     return pool[idx], idx
@@ -141,7 +140,6 @@ def recompute_counts_from_history(state: Dict[str, Any]) -> None:
     state["total_spins"] = total
 
 def update_counts(state: Dict[str, Any], _new_number: int) -> None:
-    # Recalcula da janela (robusto e simples)
     recompute_counts_from_history(state)
 
 def chi_square_bias(counts: List[int], total: int) -> Tuple[float, float]:
@@ -599,4 +597,74 @@ async def on_startup() -> None:
         ptb_app.bot_data["P_THRESHOLD"] = 0.05
         ptb_app.bot_data["WINDOW"] = 200
         ptb_app.bot_data["K"] = 14
-        ptb_app.bot_da
+        ptb_app.bot_data["NEED"] = 9
+
+        # Handlers
+        ptb_app.add_handler(CommandHandler("start", start_cmd))
+        ptb_app.add_handler(CommandHandler("help", help_cmd))
+        ptb_app.add_handler(CommandHandler("modo", modo_cmd))
+        ptb_app.add_handler(CommandHandler("status", status_cmd))
+        ptb_app.add_handler(CallbackQueryHandler(cb_handler))
+        ptb_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), number_message))
+
+        # Define webhook
+        webhook_url = f"{PUBLIC_URL}/telegram/webhook"
+        await ptb_app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=Update.ALL_TYPES
+        )
+        asyncio.create_task(ptb_app.initialize())
+        asyncio.create_task(ptb_app.start())
+        log.info("PTB inicializado e webhook configurado em %s", webhook_url)
+
+def _log_routes():
+    try:
+        routes = [getattr(r, "path", str(r)) for r in app.routes]
+        log.info("Rotas registradas: %s", routes)
+    except Exception as e:
+        log.warning("Não consegui listar rotas: %s", e)
+
+@app.on_event("startup")
+async def _startup():
+    await on_startup()
+    _log_routes()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global ptb_app
+    if ptb_app:
+        await ptb_app.stop()
+        await ptb_app.shutdown()
+        log.info("PTB finalizado.")
+
+# =========================
+# Rotas HTTP (root/health/webhook)
+# =========================
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "roulette-bot", "version": "1.8.1"}
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str = Header(None)
+):
+    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="invalid secret")
+    data = await request.json()
+    try:
+        update = Update.de_json(data, ptb_app.bot)
+        await ptb_app.process_update(update)
+    except Exception as e:
+        log.exception("Erro processando update: %s", e)
+    return JSONResponse({"ok": True})
+
+if __name__ == "__main__":
+    import uvicorn
+    log.info("Iniciando Uvicorn em 0.0.0.0:%s", PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
