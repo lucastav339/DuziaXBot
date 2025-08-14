@@ -37,20 +37,17 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.9.1-ia")
+app = FastAPI(title="Roulette Signals Bot", version="1.9.2-ia")
 ptb_app: Optional[Application] = None
 
 # =========================
-# Simulação de IA (sem mudar seu design)
+# Simulação de IA (somente efeito 'digitando…', sem moldura)
 # =========================
-IA_MODE = True          # liga/desliga a simulação
-IA_ADD_HEADER = False   # True = adiciona cabeçalho/rodapé sutil; False = visual 100% igual ao seu
-
-IA_NAME = "Oráculo IA"
-IA_TAGLINE = "Análise adaptativa"
+IA_MODE = True          # liga/desliga a simulação de IA
+IA_ADD_HEADER = False   # mantido por compatibilidade; permanece False (sem moldura)
 
 async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_delay=0.35, max_delay=0.8):
-    """Simula IA 'pensando' antes de responder (modo discreto)."""
+    """Simula IA 'pensando' antes de responder (modo discreto, sem alterar visual)."""
     if not IA_MODE:
         return
     try:
@@ -60,15 +57,11 @@ async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_dela
         pass
 
 def ia_wrap(text: str) -> str:
-    """Opcional: envolve o texto com cabeçalho/rodapé bem discretos (desligado por padrão)."""
-    if not (IA_MODE and IA_ADD_HEADER):
-        return text
-    header = f"╭─ {IA_NAME} • {IA_TAGLINE}\n"
-    footer = "╰────────────────────────"
-    return f"{header}{text}\n{footer}"
+    """Sem moldura: retorna o texto intacto."""
+    return text
 
 async def ia_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
-    """Substituto de reply_text com 'digitando…' e (opcional) moldura sutil."""
+    """Substituto de reply_text com 'digitando…' (sem moldura)."""
     await ia_typing(update, context)
     return await update.message.reply_text(ia_wrap(text), **kwargs)
 
@@ -144,12 +137,19 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
         "wins": 0,
         "losses": 0,
         "win_streak": 0,
-        "pending_bet": None,
+        "pending_bet": None,         # {"d1": "D1", "d2": "D2"} aguardando próximo giro
         # Correção
         "awaiting_correction": False,
-        "last_input": None,
-        "last_closure": {"had": False, "was_win": False, "prev_pending": None, "prev_streak": 0},
+        "last_input": None,          # último número recebido
+        "last_closure": {            # snapshot do fechamento que ocorreu no último giro
+            "had": False,
+            "was_win": False,
+            "prev_pending": None,
+            "prev_streak": 0,
+        },
+        # Base da última ENTRADA (para justificar GALE no erro)
         "last_entry_basis": {"kind": None},  # "book" | "quick" | None
+        # Anti-repetição de justificativas
         "last_just_entry_idx": -1,
         "last_just_error_idx": -1,
     }
@@ -213,7 +213,11 @@ def last_k_dozens(state: Dict[str, Any], k: int) -> List[str]:
     seq = list(state["history"])[-k:]
     return [dozen_of(x) for x in seq if 0 <= x <= 36 and dozen_of(x) is not None]
 
-def quick_edge_two_dozens(state: Dict[str, Any], k: int = 12, need: int = 7) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
+def quick_edge_two_dozens(
+    state: Dict[str, Any],
+    k: int = 12,
+    need: int = 7
+) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
     dzs = last_k_dozens(state, k)
     if len(dzs) < k:
         return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente", {"D1":0,"D2":0,"D3":0})
@@ -227,7 +231,11 @@ def quick_edge_two_dozens(state: Dict[str, Any], k: int = 12, need: int = 7) -> 
         return (True, (d1,d2,excl), f"curto-prazo: {c[d1]}+{c[d2]} em {k}", c)
     return (False, ("D1","D2","D3"), f"curto-prazo insuficiente: {c[d1]}+{c[d2]}<{need}", c)
 
-def should_enter_book_style(state: Dict[str, Any], min_spins: int, p_threshold: float) -> Tuple[bool, str, Tuple[str,str,str]]:
+def should_enter_book_style(
+    state: Dict[str, Any],
+    min_spins: int,
+    p_threshold: float
+) -> Tuple[bool, str, Tuple[str,str,str]]:
     total = state.get("total_spins", 0)
     if total < min_spins:
         return (False, f"amostra insuficiente ({total}/{min_spins})", ("D1","D2","D3"))
@@ -327,24 +335,24 @@ def prompt_next_number_text() -> str:
 # =========================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mensagem de boas-vindas com identidade iDozen (IA) e mesmo design."""
     await ensure_chat_state(update, context)
     mode_raw = context.bot_data.get("MODE", "conservador")
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
 
-    text = (
-        "🎰 **Bem-vindo ao Assistente de Sinais de Roleta**\n\n"
-        "Eu sou o seu aliado para identificar **oportunidades** na roleta usando leitura de "
-        "tendência e padrões de jogo. 📊\n\n"
-        f"⚙ **Modo Ativado:** _{mode}_\n\n"
-        "📌 **Como funciona**\n"
-        "1️⃣ Escolha o modo: **Agressivo** 🎯 ou **Conservador** 🛡️\n"
-        "2️⃣ Informe o **último número** que saiu (0–36).\n"
-        "3️⃣ Aguarde minha análise para receber as recomendações.\n\n"
-        "💡 **Dica:** Enviou o número errado? Quando surgir uma **ENTRADA**, use **✏️ Corrigir último**.\n\n"
-        "Pronto para começar? Selecione o modo abaixo e envie o número que acabou de sair. ⬇️"
+    texto = (
+        "🤖 **iDozen — Assistente Inteligente de Duas Dúzias**\n\n"
+        "🧠 _Sistema ativo_. Pronto para analisar padrões e sugerir entradas com foco em **duas dúzias**.\n\n"
+        f"🎛️ **Modo Ativado:** _{mode}_\n\n"
+        "### Como começar\n"
+        "1️⃣ Selecione o **modo de operação**: **Agressivo** 🎯 ou **Conservador** 🛡️\n"
+        "2️⃣ Envie o **último número** que saiu na roleta (**0–36**)\n"
+        "3️⃣ Aguarde a **análise** e receba a **recomendação** quando houver oportunidade\n\n"
+        "💡 *Dica:* Se enviar um número incorreto, quando surgir uma **ENTRADA** você poderá usar **✏️ Corrigir último**.\n\n"
+        "▶️ **Pronto?** Escolha o modo abaixo e informe o número que acabou de sair."
     )
 
-    await ia_send(update, context, text, reply_markup=mode_keyboard(), parse_mode="Markdown")
+    await ia_send(update, context, texto, reply_markup=mode_keyboard(), parse_mode="Markdown")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ia_send(
@@ -459,7 +467,12 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dz = dozen_of(n)
         s["bets"] += 1
         was_win = (dz in (d1p, d2p))
-        s["last_closure"] = {"had": True, "was_win": was_win, "prev_pending": prev_pending, "prev_streak": s.get("win_streak", 0)}
+        s["last_closure"] = {
+            "had": True,
+            "was_win": was_win,
+            "prev_pending": prev_pending,
+            "prev_streak": s.get("win_streak", 0),
+        }
         if was_win:
             s["wins"] += 1
             s["win_streak"] = s.get("win_streak", 0) + 1
@@ -673,7 +686,7 @@ async def _shutdown():
 # =========================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "roulette-bot", "version": "1.9.1-ia"}
+    return {"ok": True, "service": "roulette-bot", "version": "1.9.2-ia"}
 
 @app.get("/health")
 async def health():
