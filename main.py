@@ -6,12 +6,12 @@ from typing import Any, Dict, Tuple, List, Optional
 from collections import deque
 
 from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, filters
+    CommandHandler, MessageHandler, CallbackQueryHandler, filters
 )
 
 # =========================
@@ -35,15 +35,12 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.0.0")
-
-# PTB application (criada no startup)
+app = FastAPI(title="Roulette Signals Bot", version="1.1.0")
 ptb_app: Optional[Application] = None
 
 # =========================
 # Regras/Utilidades
 # =========================
-
 DOZENS = {
     "D1": set(range(1, 13)),
     "D2": set(range(13, 25)),
@@ -61,28 +58,29 @@ def dozen_of(n: int) -> Optional[str]:
 
 def make_default_state(window_max: int = 150) -> Dict[str, Any]:
     return {
-        "history": deque(maxlen=window_max),   # últimos N giros (janela deslizante)
-        "counts": [0]*37,                      # contagem por número (0..36)
-        "total_spins": 0,                      # dentro da janela
+        "history": deque(maxlen=window_max),
+        "counts": [0]*37,
+        "total_spins": 0,
         "gale_active": False,
-        "gale_level": 0,                       # 0 (sem gale) ou 1 (Gale 1)
+        "gale_level": 0,
         "last_recommendation": ("D1","D2","D3"),
         "last_reason": "",
         "window_max": window_max,
+        # Estatísticas de acerto
+        "bets": 0,
+        "wins": 0,
+        "pending_bet": None,         # {"d1": "D1", "d2": "D2"} aguardando próximo giro
+        # Correção
+        "awaiting_correction": False,
+        "last_input": None,          # último número recebido
+        "last_closure": {            # snapshot do fechamento que ocorreu no último giro
+            "had": False,            # True se houve fechamento de aposta
+            "was_win": False,        # True se foi acerto
+            "prev_pending": None,    # pending_bet antes de fechar
+        },
     }
 
-def update_counts(state: Dict[str, Any], new_number: int) -> None:
-    """
-    Atualiza contagens respeitando a janela deslizante.
-    Precisa ser chamada logo após empurrar para history (deque).
-    """
-    # Se a deque estava cheia, o elemento mais antigo foi descartado agora
-    # Removemos sua contribuição:
-    # Observação: deque descarta automaticamente no append; então precisamos saber
-    # qual foi descartado. Truque: antes do append, checar o 0º; porém como já
-    # adicionamos, faremos assim: se lotada antes, old era o que estava no índice 0
-    # Para simplificar, faremos um ajuste: calcularemos a contagem a partir do histórico quando necessário.
-    # Para robustez e simplicidade, recalcular:
+def recompute_counts_from_history(state: Dict[str, Any]) -> None:
     counts = [0]*37
     total = 0
     for x in state["history"]:
@@ -92,59 +90,42 @@ def update_counts(state: Dict[str, Any], new_number: int) -> None:
     state["counts"] = counts
     state["total_spins"] = total
 
+def update_counts(state: Dict[str, Any], _new_number: int) -> None:
+    # Recalcula da janela (robusto e simples)
+    recompute_counts_from_history(state)
+
 def chi_square_bias(counts: List[int], total: int) -> Tuple[float, float]:
-    """
-    Qui-quadrado simples contra distribuição uniforme (37 pockets).
-    Retorna (chi2, p_aproximado). p é uma aproximação via Wilson-Hilferty / normal,
-    suficiente para gating básico sem SciPy.
-    """
     if total <= 0:
         return 0.0, 1.0
     exp = total / 37.0
     chi2 = 0.0
     for c in counts:
         chi2 += (c - exp) ** 2 / exp
-
-    # Aproximação de p-valor:
-    # Graus de liberdade df = 36. Converter qui-quadrado -> normal aprox.
-    df = 36.0
-    # Wilson-Hilferty: Z ≈ ( (X/df)^(1/3) - (1 - 2/(9df)) ) / sqrt(2/(9df))
     import math
+    df = 36.0
     if chi2 <= 0:
         return 0.0, 1.0
     z = ((chi2/df)**(1.0/3.0) - (1 - 2/(9*df))) / math.sqrt(2/(9*df))
-    # p ~ 1 - Phi(z)
-    # Phi(z) ~ 0.5*(1+erf(z/sqrt(2)))
     p = 1 - 0.5*(1 + math.erf(z / math.sqrt(2)))
     p = max(0.0, min(1.0, p))
     return chi2, p
 
 def find_hottest_sector(counts: List[int], window_len: int = 12) -> List[int]:
-    """
-    Acha o setor circular de comprimento 'window_len' com maior soma (0..36).
-    Retorna a lista de pockets (índices) do setor (comprimento window_len).
-    """
     n = 37
     if window_len >= n:
         return list(range(n))
     extended = counts + counts[:window_len-1]
-    max_sum = -1
+    max_sum = sum(extended[:window_len])
     best_start = 0
-    cur_sum = sum(extended[:window_len])
-    max_sum = cur_sum
+    cur_sum = max_sum
     for i in range(1, n):
         cur_sum += extended[i+window_len-1] - extended[i-1]
         if cur_sum > max_sum:
             max_sum = cur_sum
             best_start = i
-    sector = [(best_start + j) % n for j in range(window_len)]
-    return sector
+    return [(best_start + j) % n for j in range(window_len)]
 
 def sector_to_two_dozens(sector: List[int]) -> Tuple[str, str, str]:
-    """
-    Converte setor (lista de pockets 0..36) nas duas dúzias que melhor o cobrem.
-    Heurística: conta cobertura por D1, D2, D3 (ignorando zeros) e escolhe as top-2.
-    """
     hits = {"D1":0,"D2":0,"D3":0}
     for p in sector:
         d = dozen_of(p)
@@ -164,10 +145,6 @@ def quick_edge_two_dozens(
     k: int = 12,
     need: int = 7
 ) -> Tuple[bool, Tuple[str,str,str], str]:
-    """
-    OR de curto prazo: se, nos últimos k giros, duas dúzias somam >= need ocorrências,
-    recomenda essas duas e exclui a restante.
-    """
     dzs = last_k_dozens(state, k)
     if len(dzs) < k:
         return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente")
@@ -189,7 +166,7 @@ def should_enter_book_style(
     total = state.get("total_spins", 0)
     if total < min_spins:
         return (False, f"amostra insuficiente ({total}/{min_spins})", ("D1","D2","D3"))
-    chi2, p = chi_square_bias(state["counts"], total)
+    _, p = chi_square_bias(state["counts"], total)
     if p > p_threshold:
         return (False, f"sem viés detectável (p≈{p:.3f})", ("D1","D2","D3"))
     sector = find_hottest_sector(state["counts"], window_len=12)
@@ -198,10 +175,33 @@ def should_enter_book_style(
 
 def format_reco_text(d1: str, d2: str, excl: str, reason: str, mode: str, params: Dict[str, Any]) -> str:
     return (
+        f"🎬 **ENTRAR**\n"
         f"🎯 Recomendação: **{d1} + {d2}**  |  🚫 Excluída: {excl}\n"
         f"📖 Critério: {reason}\n"
         f"⚙️ Modo: {mode}  | p≤{params['P_THRESHOLD']}  | K={params['K']} NEED={params['NEED']}  | janela={params['WINDOW']}\n"
-        f"ℹ️ Envie números (0–36)."
+        f"ℹ️ Envie o próximo número."
+    )
+
+def format_wait_text(reason: str, mode: str, params: Dict[str, Any]) -> str:
+    return (
+        f"⏳ **Aguardar**\n"
+        f"📖 Critério: {reason}\n"
+        f"⚙️ Modo: {mode}  | p≤{params['P_THRESHOLD']}  | K={params['K']} NEED={params['NEED']}  | janela={params['WINDOW']}\n"
+        f"ℹ️ Envie o próximo número."
+    )
+
+def format_stats(state: Dict[str, Any]) -> str:
+    b = state.get("bets", 0)
+    w = state.get("wins", 0)
+    rate = (w / b * 100) if b else 0.0
+    return f"📊 Acertos: {w}/{b}  ({rate:.1f}%)"
+
+def default_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✏️ Corrigir último", callback_data="fix_last"),
+            InlineKeyboardButton("🗑️ Reset histórico", callback_data="reset_hist"),
+        ]]
     )
 
 # =========================
@@ -216,7 +216,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /modo agressivo ou /modo conservador.\n"
         "Envie números (0–36) a cada giro."
     )
-    await update.message.reply_text(text + f"\nModo atual: {mode}")
+    await update.message.reply_text(text + f"\nModo atual: {mode}", reply_markup=default_keyboard())
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -224,15 +224,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start – iniciar\n"
         "/modo agressivo|conservador – perfil de entradas\n"
         "/status – ver parâmetros e última recomendação\n"
-        "Envie números (0–36) como mensagens."
+        "Envie números (0–36) como mensagens.",
+        reply_markup=default_keyboard()
     )
 
 async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Apenas agressivo e conservador visíveis
     if not context.args:
         cur = context.bot_data.get("MODE", "conservador")
         await update.message.reply_text(
-            f"Modo atual: {cur}\nUse: /modo agressivo  ou  /modo conservador"
+            f"Modo atual: {cur}\nUse: /modo agressivo  ou  /modo conservador",
+            reply_markup=default_keyboard()
         )
         return
 
@@ -255,7 +256,7 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "✅ Modo conservador ativado: entradas mais seletivas."
     else:
         msg = "Use: /modo agressivo  ou  /modo conservador"
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, reply_markup=default_keyboard())
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
@@ -269,13 +270,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     d1, d2, excl = s.get("last_recommendation", ("D1","D2","D3"))
     reason = s.get("last_reason","—")
-    msg = format_reco_text(d1, d2, excl, reason, mode, params)
-    await update.message.reply_text(msg)
+    msg = format_reco_text(d1, d2, excl, reason, mode, params) + "\n" + format_stats(s)
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=default_keyboard())
 
 async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Recebe números 0–36 e decide se recomenda entrada em duas dúzias.
-    """
     await ensure_chat_state(update, context)
     s = context.chat_data["state"]
 
@@ -284,13 +282,79 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     n = int(text)
     if n < 0 or n > 36:
-        await update.message.reply_text("Envie números entre 0 e 36.")
+        await update.message.reply_text("Envie números entre 0 e 36.", reply_markup=default_keyboard())
         return
+
+    # Caso esteja em modo de correção: substitui o último número pelo informado
+    if s.get("awaiting_correction", False):
+        if len(s["history"]) == 0 or s["last_input"] is None:
+            s["awaiting_correction"] = False
+            await update.message.reply_text("Nada para corrigir no momento.", reply_markup=default_keyboard())
+            return
+
+        old = s["last_input"]
+        # Reverter efeitos do último giro:
+        # 1) remove último número do histórico
+        if len(s["history"]) > 0:
+            s["history"].pop()
+        # 2) reverter estatísticas se houve fechamento naquele giro
+        lc = s.get("last_closure", {"had": False})
+        if lc.get("had", False):
+            # desfaz o fechamento anterior
+            if s["bets"] > 0:
+                s["bets"] -= 1
+            if lc.get("was_win", False) and s["wins"] > 0:
+                s["wins"] -= 1
+            # recalcula fechamento com o número corrigido e o prev_pending original
+            prev_pending = lc.get("prev_pending")
+            dz = dozen_of(n)
+            s["bets"] += 1
+            if prev_pending and dz in (prev_pending["d1"], prev_pending["d2"]):
+                s["wins"] += 1
+            # pending_bet permanece None, pois o fechamento já ocorreu
+
+        # 3) adiciona o número corrigido
+        s["history"].append(n)
+        # 4) reconta
+        recompute_counts_from_history(s)
+        # 5) atualiza last_input e sai do modo correção
+        s["last_input"] = n
+        s["awaiting_correction"] = False
+
+        await update.message.reply_text(
+            f"✔️ Corrigido: {old} → {n}\n" + format_stats(s),
+            reply_markup=default_keyboard()
+        )
+        return
+
+    # --- FECHAMENTO DE APOSTA PENDENTE (se havia entrada no giro anterior) ---
+    # Snapshot do pending antes de fechar (para eventual correção)
+    prev_pending = s["pending_bet"]
+    if s.get("pending_bet"):
+        d1 = s["pending_bet"]["d1"]; d2 = s["pending_bet"]["d2"]
+        dz = dozen_of(n)
+        s["bets"] += 1
+        was_win = (dz in (d1, d2))
+        if was_win:
+            s["wins"] += 1
+            result_text = f"✅ Acertou ({n}{'' if dz is None else f' em {dz}'})."
+        else:
+            result_text = f"❌ Errou ({n}{'' if dz is None else f' em {dz}'})."
+        s["pending_bet"] = None
+        s["gale_active"] = False
+        s["gale_level"] = 0
+        # registra snapshot do fechamento para possível correção
+        s["last_closure"] = {"had": True, "was_win": was_win, "prev_pending": prev_pending}
+        await update.message.reply_text(result_text + "\n" + format_stats(s), reply_markup=default_keyboard())
+    else:
+        # não houve fechamento nesse giro
+        s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None}
 
     # 1) Empilha no histórico (janela deslizante)
     s["history"].append(n)
     # 2) Recalcula contagens dentro da janela
     update_counts(s, n)
+    s["last_input"] = n
 
     # 3) Parâmetros de decisão
     MIN_SPINS = context.bot_data.get("MIN_SPINS", 15)
@@ -316,40 +380,62 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if enter:
         await update.message.reply_text(
-            "🎬 **ENTRAR**\n" + format_reco_text(d1, d2, excl, reason, mode, params),
-            parse_mode="Markdown"
+            format_reco_text(d1, d2, excl, reason, mode, params),
+            parse_mode="Markdown",
+            reply_markup=default_keyboard()
         )
-        # Gale 1 opcional (sinalizar estado)
+        s["pending_bet"] = {"d1": d1, "d2": d2}
         s["gale_active"] = True
         s["gale_level"] = 0
     else:
         await update.message.reply_text(
-            "⏳ **Aguardar**\n" + format_reco_text(d1, d2, excl, reason, mode, params),
-            parse_mode="Markdown"
+            format_wait_text(reason, mode, params),
+            parse_mode="Markdown",
+            reply_markup=default_keyboard()
         )
 
+async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback dos botões inline."""
+    await ensure_chat_state(update, context)
+    s = context.chat_data["state"]
+    query = update.callback_query
+    data = query.data
+
+    if data == "fix_last":
+        if len(s["history"]) == 0 or s["last_input"] is None:
+            await query.answer("Nada para corrigir.")
+            await query.edit_message_reply_markup(reply_markup=default_keyboard())
+            return
+        s["awaiting_correction"] = True
+        await query.answer()
+        await query.message.reply_text(
+            f"✏️ Envie o número correto para substituir o último: {s['last_input']}",
+            reply_markup=default_keyboard()
+        )
+    elif data == "reset_hist":
+        win = context.bot_data.get("WINDOW", s.get("window_max", 150))
+        context.chat_data["state"] = make_default_state(window_max=win)
+        await query.answer("Histórico resetado.")
+        await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.", reply_markup=default_keyboard())
+    else:
+        await query.answer()
+
 async def ensure_chat_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Garante state por chat e aplica janela configurada no modo atual.
-    """
     if "state" not in context.chat_data:
-        # usa janela do modo atual (se já definida em bot_data) ou 150
         win = context.bot_data.get("WINDOW", 150)
         context.chat_data["state"] = make_default_state(window_max=win)
     else:
-        # se o modo mudou a janela, atualiza
         s = context.chat_data["state"]
         win = context.bot_data.get("WINDOW", s.get("window_max", 150))
         if s.get("window_max") != win:
             old_hist = list(s["history"])
             s["history"] = deque(old_hist, maxlen=win)
             s["window_max"] = win
-            update_counts(s, -1)  # força recálculo
+            recompute_counts_from_history(s)
 
 # =========================
 # PTB + Webhook bootstrap
 # =========================
-
 async def on_startup() -> None:
     global ptb_app
     if ptb_app is None:
@@ -373,6 +459,7 @@ async def on_startup() -> None:
         ptb_app.add_handler(CommandHandler("help", help_cmd))
         ptb_app.add_handler(CommandHandler("modo", modo_cmd))
         ptb_app.add_handler(CommandHandler("status", status_cmd))
+        ptb_app.add_handler(CallbackQueryHandler(cb_handler))
         ptb_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), number_message))
 
         # Define webhook
@@ -382,7 +469,6 @@ async def on_startup() -> None:
             secret_token=WEBHOOK_SECRET,
             allowed_updates=Update.ALL_TYPES
         )
-        # Inicia PTB (rodará em background, FastAPI atende HTTP)
         asyncio.create_task(ptb_app.initialize())
         asyncio.create_task(ptb_app.start())
         log.info("PTB inicializado e webhook configurado em %s", webhook_url)
@@ -410,7 +496,6 @@ async def telegram_webhook(
 ):
     if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="invalid secret")
-
     data = await request.json()
     try:
         update = Update.de_json(data, ptb_app.bot)
@@ -419,8 +504,6 @@ async def telegram_webhook(
         log.exception("Erro processando update: %s", e)
     return JSONResponse({"ok": True})
 
-# Para rodar localmente:
-# uvicorn main:app --host 0.0.0.0 --port 10000
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
