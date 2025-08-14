@@ -35,7 +35,7 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.1.0")
+app = FastAPI(title="Roulette Signals Bot", version="1.2.0")
 ptb_app: Optional[Application] = None
 
 # =========================
@@ -66,9 +66,11 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
         "last_recommendation": ("D1","D2","D3"),
         "last_reason": "",
         "window_max": window_max,
-        # Estatísticas de acerto
+        # Estatísticas
         "bets": 0,
         "wins": 0,
+        "losses": 0,
+        "win_streak": 0,
         "pending_bet": None,         # {"d1": "D1", "d2": "D2"} aguardando próximo giro
         # Correção
         "awaiting_correction": False,
@@ -77,6 +79,7 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
             "had": False,            # True se houve fechamento de aposta
             "was_win": False,        # True se foi acerto
             "prev_pending": None,    # pending_bet antes de fechar
+            "prev_streak": 0,        # streak antes do fechamento
         },
     }
 
@@ -173,6 +176,20 @@ def should_enter_book_style(
     d1, d2, excl = sector_to_two_dozens(sector)
     return (True, "viés detectado", (d1,d2,excl))
 
+def stats_text(state: Dict[str, Any]) -> str:
+    b = state.get("bets", 0)
+    w = state.get("wins", 0)
+    l = state.get("losses", 0)
+    rate = (w / b * 100) if b else 0.0
+    streak = state.get("win_streak", 0)
+    return (
+        f"📊 Estatísticas\n"
+        f"✅ Acertos: {w}\n"
+        f"❌ Erros: {l}\n"
+        f"📈 Taxa: {rate:.1f}%  (em {b} apostas)\n"
+        f"🔥 Sequência de vitórias: {streak}"
+    )
+
 def format_reco_text(d1: str, d2: str, excl: str, reason: str, mode: str, params: Dict[str, Any]) -> str:
     return (
         f"🎬 **ENTRAR**\n"
@@ -190,13 +207,8 @@ def format_wait_text(reason: str, mode: str, params: Dict[str, Any]) -> str:
         f"ℹ️ Envie o próximo número."
     )
 
-def format_stats(state: Dict[str, Any]) -> str:
-    b = state.get("bets", 0)
-    w = state.get("wins", 0)
-    rate = (w / b * 100) if b else 0.0
-    return f"📊 Acertos: {w}/{b}  ({rate:.1f}%)"
-
-def default_keyboard() -> InlineKeyboardMarkup:
+def entry_keyboard() -> InlineKeyboardMarkup:
+    # Botões somente quando HÁ ENTRADA
     return InlineKeyboardMarkup(
         [[
             InlineKeyboardButton("✏️ Corrigir último", callback_data="fix_last"),
@@ -216,7 +228,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /modo agressivo ou /modo conservador.\n"
         "Envie números (0–36) a cada giro."
     )
-    await update.message.reply_text(text + f"\nModo atual: {mode}", reply_markup=default_keyboard())
+    await update.message.reply_text(text + f"\nModo atual: {mode}")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -224,16 +236,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start – iniciar\n"
         "/modo agressivo|conservador – perfil de entradas\n"
         "/status – ver parâmetros e última recomendação\n"
-        "Envie números (0–36) como mensagens.",
-        reply_markup=default_keyboard()
+        "Envie números (0–36) como mensagens."
     )
 
 async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         cur = context.bot_data.get("MODE", "conservador")
         await update.message.reply_text(
-            f"Modo atual: {cur}\nUse: /modo agressivo  ou  /modo conservador",
-            reply_markup=default_keyboard()
+            f"Modo atual: {cur}\nUse: /modo agressivo  ou  /modo conservador"
         )
         return
 
@@ -256,7 +266,7 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "✅ Modo conservador ativado: entradas mais seletivas."
     else:
         msg = "Use: /modo agressivo  ou  /modo conservador"
-    await update.message.reply_text(msg, reply_markup=default_keyboard())
+    await update.message.reply_text(msg)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
@@ -270,8 +280,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     d1, d2, excl = s.get("last_recommendation", ("D1","D2","D3"))
     reason = s.get("last_reason","—")
-    msg = format_reco_text(d1, d2, excl, reason, mode, params) + "\n" + format_stats(s)
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=default_keyboard())
+    msg = format_reco_text(d1, d2, excl, reason, mode, params) + "\n" + stats_text(s)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
@@ -282,73 +292,89 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     n = int(text)
     if n < 0 or n > 36:
-        await update.message.reply_text("Envie números entre 0 e 36.", reply_markup=default_keyboard())
+        await update.message.reply_text("Envie números entre 0 e 36.")
         return
 
-    # Caso esteja em modo de correção: substitui o último número pelo informado
+    # Correção: se aguardando número de correção, substitui o último
     if s.get("awaiting_correction", False):
         if len(s["history"]) == 0 or s["last_input"] is None:
             s["awaiting_correction"] = False
-            await update.message.reply_text("Nada para corrigir no momento.", reply_markup=default_keyboard())
+            await update.message.reply_text("Nada para corrigir no momento.")
             return
 
         old = s["last_input"]
-        # Reverter efeitos do último giro:
-        # 1) remove último número do histórico
+        # Remove último número do histórico
         if len(s["history"]) > 0:
             s["history"].pop()
-        # 2) reverter estatísticas se houve fechamento naquele giro
+
+        # Reverte estatísticas do fechamento anterior e re-aplica sobre o novo valor
         lc = s.get("last_closure", {"had": False})
         if lc.get("had", False):
             # desfaz o fechamento anterior
             if s["bets"] > 0:
                 s["bets"] -= 1
-            if lc.get("was_win", False) and s["wins"] > 0:
-                s["wins"] -= 1
-            # recalcula fechamento com o número corrigido e o prev_pending original
-            prev_pending = lc.get("prev_pending")
-            dz = dozen_of(n)
-            s["bets"] += 1
-            if prev_pending and dz in (prev_pending["d1"], prev_pending["d2"]):
-                s["wins"] += 1
-            # pending_bet permanece None, pois o fechamento já ocorreu
+            if lc.get("was_win", False):
+                if s["wins"] > 0:
+                    s["wins"] -= 1
+                # ao desfazer uma vitória, volta o streak ao valor anterior salvo
+                s["win_streak"] = lc.get("prev_streak", 0)
+            else:
+                if s["losses"] > 0:
+                    s["losses"] -= 1
+                # ao desfazer uma derrota, o streak anterior era o salvo
+                s["win_streak"] = lc.get("prev_streak", 0)
 
-        # 3) adiciona o número corrigido
+            # aplica o fechamento com o número corrigido
+            prev_pending = lc.get("prev_pending")
+            dz_new = dozen_of(n)
+            s["bets"] += 1
+            if prev_pending and dz_new in (prev_pending["d1"], prev_pending["d2"]):
+                s["wins"] += 1
+                s["win_streak"] = lc.get("prev_streak", 0) + 1
+            else:
+                s["losses"] += 1
+                s["win_streak"] = 0
+
+        # Adiciona o número corrigido e reconta
         s["history"].append(n)
-        # 4) reconta
         recompute_counts_from_history(s)
-        # 5) atualiza last_input e sai do modo correção
         s["last_input"] = n
         s["awaiting_correction"] = False
 
         await update.message.reply_text(
-            f"✔️ Corrigido: {old} → {n}\n" + format_stats(s),
-            reply_markup=default_keyboard()
+            f"✔️ Corrigido: {old} → {n}\n" + stats_text(s)
         )
         return
 
-    # --- FECHAMENTO DE APOSTA PENDENTE (se havia entrada no giro anterior) ---
-    # Snapshot do pending antes de fechar (para eventual correção)
+    # --- FECHAMENTO DE APOSTA PENDENTE (resultado do giro anterior) ---
     prev_pending = s["pending_bet"]
     if s.get("pending_bet"):
         d1 = s["pending_bet"]["d1"]; d2 = s["pending_bet"]["d2"]
         dz = dozen_of(n)
         s["bets"] += 1
         was_win = (dz in (d1, d2))
+        # salva snapshot para possível correção
+        s["last_closure"] = {
+            "had": True,
+            "was_win": was_win,
+            "prev_pending": prev_pending,
+            "prev_streak": s.get("win_streak", 0),
+        }
         if was_win:
             s["wins"] += 1
+            s["win_streak"] = s.get("win_streak", 0) + 1
             result_text = f"✅ Acertou ({n}{'' if dz is None else f' em {dz}'})."
         else:
+            s["losses"] += 1
+            s["win_streak"] = 0
             result_text = f"❌ Errou ({n}{'' if dz is None else f' em {dz}'})."
         s["pending_bet"] = None
         s["gale_active"] = False
         s["gale_level"] = 0
-        # registra snapshot do fechamento para possível correção
-        s["last_closure"] = {"had": True, "was_win": was_win, "prev_pending": prev_pending}
-        await update.message.reply_text(result_text + "\n" + format_stats(s), reply_markup=default_keyboard())
+        await update.message.reply_text(result_text + "\n" + stats_text(s))
     else:
         # não houve fechamento nesse giro
-        s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None}
+        s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None, "prev_streak": s.get("win_streak", 0)}
 
     # 1) Empilha no histórico (janela deslizante)
     s["history"].append(n)
@@ -379,10 +405,11 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     params = {"P_THRESHOLD": P_THRESHOLD, "K": K, "NEED": NEED, "WINDOW": s["window_max"]}
 
     if enter:
+        # SOMENTE AQUI mostramos os botões
         await update.message.reply_text(
             format_reco_text(d1, d2, excl, reason, mode, params),
             parse_mode="Markdown",
-            reply_markup=default_keyboard()
+            reply_markup=entry_keyboard()
         )
         s["pending_bet"] = {"d1": d1, "d2": d2}
         s["gale_active"] = True
@@ -390,12 +417,11 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             format_wait_text(reason, mode, params),
-            parse_mode="Markdown",
-            reply_markup=default_keyboard()
+            parse_mode="Markdown"
         )
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback dos botões inline."""
+    """Callback dos botões inline (somente exibidos na mensagem de ENTRAR)."""
     await ensure_chat_state(update, context)
     s = context.chat_data["state"]
     query = update.callback_query
@@ -404,19 +430,20 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "fix_last":
         if len(s["history"]) == 0 or s["last_input"] is None:
             await query.answer("Nada para corrigir.")
-            await query.edit_message_reply_markup(reply_markup=default_keyboard())
+            await query.edit_message_reply_markup()  # remove teclados antigos
             return
         s["awaiting_correction"] = True
         await query.answer()
         await query.message.reply_text(
-            f"✏️ Envie o número correto para substituir o último: {s['last_input']}",
-            reply_markup=default_keyboard()
+            f"✏️ Envie o número correto para substituir o último: {s['last_input']}"
         )
+        await query.edit_message_reply_markup()  # remove teclados da msg antiga
     elif data == "reset_hist":
         win = context.bot_data.get("WINDOW", s.get("window_max", 150))
         context.chat_data["state"] = make_default_state(window_max=win)
         await query.answer("Histórico resetado.")
-        await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.", reply_markup=default_keyboard())
+        await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.")
+        await query.edit_message_reply_markup()  # remove teclados da msg antiga
     else:
         await query.answer()
 
