@@ -44,7 +44,7 @@ ptb_app: Optional[Application] = None
 # Simulação de IA (sem mudar seu design)
 # =========================
 IA_MODE = True          # liga/desliga a simulação
-IA_ADD_HEADER = False   # True = adiciona cabeçalho/rodapé sutil; False = visual 100% igual ao seu
+IA_ADD_HEADER = true   # True = adiciona cabeçalho/rodapé sutil; False = visual 100% igual ao seu
 
 IA_NAME = "Oráculo IA"
 IA_TAGLINE = "Análise adaptativa"
