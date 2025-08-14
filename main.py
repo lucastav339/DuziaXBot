@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application, ApplicationBuilder, ContextTypes,
     CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -36,8 +37,40 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.9.0")
+app = FastAPI(title="Roulette Signals Bot", version="1.9.1-ia")
 ptb_app: Optional[Application] = None
+
+# =========================
+# Simulação de IA (sem mudar seu design)
+# =========================
+IA_MODE = True          # liga/desliga a simulação
+IA_ADD_HEADER = False   # cabeçalho/rodapé sutis (False = não altera visual)
+
+IA_NAME = "Oráculo IA"
+IA_TAGLINE = "Análise adaptativa"
+
+async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_delay=0.35, max_delay=0.8):
+    """Simula IA 'pensando' antes de responder (modo discreto)."""
+    if not IA_MODE:
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        await asyncio.sleep(random.uniform(min_delay, max_delay))
+    except Exception:
+        pass
+
+def ia_wrap(text: str) -> str:
+    """Opcional: envolve o texto com cabeçalho/rodapé bem discretos (desligado por padrão)."""
+    if not (IA_MODE and IA_ADD_HEADER):
+        return text
+    header = f"╭─ {IA_NAME} • {IA_TAGLINE}\n"
+    footer = "╰────────────────────────"
+    return f"{header}{text}\n{footer}"
+
+async def ia_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    """Substituto de reply_text com 'digitando…' e (opcional) moldura sutil."""
+    await ia_typing(update, context)
+    return await update.message.reply_text(ia_wrap(text), **kwargs)
 
 # =========================
 # “Justificativas” aleatórias (entrada/erro) sem repetição consecutiva
@@ -69,7 +102,6 @@ JUSTIFICATIVAS_ERRO = [
 ]
 
 def pick_no_repeat(pool: List[str], last_idx: int) -> Tuple[str, int]:
-    """Escolhe índice aleatório diferente de last_idx. Retorna (texto, novo_idx)."""
     if not pool:
         return "", -1
     if len(pool) == 1:
@@ -112,19 +144,17 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
         "wins": 0,
         "losses": 0,
         "win_streak": 0,
-        "pending_bet": None,         # {"d1": "D1", "d2": "D2"} aguardando próximo giro
+        "pending_bet": None,
         # Correção
         "awaiting_correction": False,
-        "last_input": None,          # último número recebido
-        "last_closure": {            # snapshot do fechamento que ocorreu no último giro
-            "had": False,            # True se houve fechamento de aposta
-            "was_win": False,        # True se foi acerto
-            "prev_pending": None,    # pending_bet antes de fechar
-            "prev_streak": 0,        # streak antes do fechamento
+        "last_input": None,
+        "last_closure": {
+            "had": False,
+            "was_win": False,
+            "prev_pending": None,
+            "prev_streak": 0,
         },
-        # Base da última ENTRADA (para justificar GALE no erro)
         "last_entry_basis": {"kind": None},  # "book" | "quick" | None
-        # Anti-repetição de justificativas
         "last_just_entry_idx": -1,
         "last_just_error_idx": -1,
     }
@@ -277,7 +307,6 @@ def gale_justification_text(state: Dict[str, Any], d1: str, d2: str) -> str:
         )
 
 def entry_keyboard() -> InlineKeyboardMarkup:
-    # Botões somente quando HÁ ENTRADA
     return InlineKeyboardMarkup(
         [
             [
@@ -292,7 +321,6 @@ def entry_keyboard() -> InlineKeyboardMarkup:
     )
 
 def mode_keyboard() -> InlineKeyboardMarkup:
-    # Teclado só com modos (usado no /start)
     return InlineKeyboardMarkup(
         [[
             InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
@@ -329,14 +357,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Pronto para começar? Selecione o modo abaixo e envie o número que acabou de sair. ⬇️"
     )
 
-    await update.message.reply_text(
-        text,
-        reply_markup=mode_keyboard(),
-        parse_mode="Markdown"
-    )
+    await ia_send(update, context, text, reply_markup=mode_keyboard(), parse_mode="Markdown")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await ia_send(
+        update, context,
         "Comandos:\n"
         "/start – iniciar\n"
         "/modo agressivo|conservador – perfil de entradas\n"
@@ -348,7 +373,7 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         cur = context.bot_data.get("MODE", "conservador")
         cur_pt = "Agressivo" if cur.lower().startswith("agress") else "Conservador"
-        await update.message.reply_text(f"🧩 Modo Ativado: {cur_pt}\nUse: /modo agressivo  ou  /modo conservador")
+        await ia_send(update, context, f"🧩 Modo Ativado: {cur_pt}\nUse: /modo agressivo  ou  /modo conservador")
         return
 
     arg = context.args[0].lower().strip()
@@ -370,8 +395,8 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "✅ Modo conservador ativado."
     else:
         msg = "Use: /modo agressivo  ou  /modo conservador"
-    await update.message.reply_text(msg)
-    await update.message.reply_text(prompt_next_number_text())
+    await ia_send(update, context, msg)
+    await ia_send(update, context, prompt_next_number_text())
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
@@ -384,7 +409,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Última recomendação: {d1} + {d2}\n"
         + stats_text(s)
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await ia_send(update, context, msg, parse_mode="Markdown")
 
 async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
@@ -395,14 +420,14 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     n = int(text)
     if n < 0 or n > 36:
-        await update.message.reply_text("Envie números entre 0 e 36.")
+        await ia_send(update, context, "Envie números entre 0 e 36.")
         return
 
     # Correção: se aguardando número de correção, substitui o último
     if s.get("awaiting_correction", False):
         if len(s["history"]) == 0 or s["last_input"] is None:
             s["awaiting_correction"] = False
-            await update.message.reply_text("Nada para corrigir no momento.")
+            await ia_send(update, context, "Nada para corrigir no momento.")
             return
 
         old = s["last_input"]
@@ -437,7 +462,7 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s["last_input"] = n
         s["awaiting_correction"] = False
 
-        await update.message.reply_text(f"✔️ Corrigido: {old} → {n}\n" + stats_text(s))
+        await ia_send(update, context, f"✔️ Corrigido: {old} → {n}\n" + stats_text(s))
         return
 
     # --- FECHAMENTO DE APOSTA PENDENTE (resultado do giro anterior) ---
@@ -459,20 +484,20 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_text = f"✅ Acertou ({n}{'' if dz is None else f' em {dz}'})."
             s["gale_active"] = False
             s["gale_level"] = 0
-            await update.message.reply_text(result_text + "\n" + stats_text(s))
+            await ia_send(update, context, result_text + "\n" + stats_text(s))
         else:
             s["losses"] += 1
             s["win_streak"] = 0
             result_text = f"❌ Errou ({n}{'' if dz is None else f' em {dz}'})."
             s["gale_active"] = True
             s["gale_level"] = 1
-            await update.message.reply_text(result_text + "\n" + stats_text(s))
+            await ia_send(update, context, result_text + "\n" + stats_text(s))
             # Desculpa técnica aleatória (sem repetir)
             txt, idx = pick_no_repeat(JUSTIFICATIVAS_ERRO, s.get("last_just_error_idx", -1))
             s["last_just_error_idx"] = idx
-            await update.message.reply_text(f"📖 {txt}")
+            await ia_send(update, context, f"📖 {txt}")
             # Orientação GALE com justificativa
-            await update.message.reply_text(gale_justification_text(s, d1p, d2p))
+            await ia_send(update, context, gale_justification_text(s, d1p, d2p))
 
         s["pending_bet"] = None
     else:
@@ -511,22 +536,19 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
 
     if enter:
-        # Justificativa de ENTRAR aleatória (sem repetir)
         txt, idx = pick_no_repeat(JUSTIFICATIVAS_ENTRADA, s.get("last_just_entry_idx", -1))
         s["last_just_entry_idx"] = idx
-        await update.message.reply_text(
+        await ia_send(
+            update, context,
             format_reco_text(d1, d2, mode) + f"\n📖 {txt}",
             parse_mode="Markdown",
             reply_markup=entry_keyboard()
         )
         s["pending_bet"] = {"d1": d1, "d2": d2}
-        s["gale_active"] = True  # indicador informativo
+        s["gale_active"] = True
         s["gale_level"] = 0
     else:
-        await update.message.reply_text(
-            format_wait_text(mode),
-            parse_mode="Markdown"
-        )
+        await ia_send(update, context, format_wait_text(mode), parse_mode="Markdown")
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback dos botões inline (modos + corrigir/reset)."""
@@ -539,18 +561,22 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(s["history"]) == 0 or s["last_input"] is None:
             await query.answer("Nada para corrigir.")
             await query.edit_message_reply_markup()
+            await ia_typing(update, context, 0.25, 0.5)
+            await query.message.reply_text("Nada para corrigir.")
             return
         s["awaiting_correction"] = True
         await query.answer()
-        await query.message.reply_text(f"✏️ Envie o número correto para substituir o último: {s['last_input']}")
         await query.edit_message_reply_markup()
+        await ia_typing(update, context, 0.25, 0.5)
+        await query.message.reply_text(f"✏️ Envie o número correto para substituir o último: {s['last_input']}")
 
     elif data == "reset_hist":
         win = context.bot_data.get("WINDOW", s.get("window_max", 150))
         context.chat_data["state"] = make_default_state(window_max=win)
         await query.answer("Histórico resetado.")
-        await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.")
         await query.edit_message_reply_markup()
+        await ia_typing(update, context, 0.25, 0.5)
+        await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.")
 
     elif data == "set_agressivo":
         context.bot_data["MODE"] = "agressivo"
@@ -560,9 +586,11 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["K"] = 10
         context.bot_data["NEED"] = 6
         await query.answer("Modo agressivo ativado.")
-        await query.message.reply_text("✅ Modo agressivo ativado.")
-        await query.message.reply_text(prompt_next_number_text())
         await query.edit_message_reply_markup()
+        await ia_typing(update, context, 0.3, 0.6)
+        await query.message.reply_text("✅ Modo agressivo ativado.")
+        await ia_typing(update, context, 0.2, 0.45)
+        await query.message.reply_text(prompt_next_number_text())
 
     elif data == "set_conservador":
         context.bot_data["MODE"] = "conservador"
@@ -572,9 +600,11 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["K"] = 14
         context.bot_data["NEED"] = 9
         await query.answer("Modo conservador ativado.")
-        await query.message.reply_text("✅ Modo conservador ativado.")
-        await query.message.reply_text(prompt_next_number_text())
         await query.edit_message_reply_markup()
+        await ia_typing(update, context, 0.3, 0.6)
+        await query.message.reply_text("✅ Modo conservador ativado.")
+        await ia_typing(update, context, 0.2, 0.45)
+        await query.message.reply_text(prompt_next_number_text())
 
     else:
         await query.answer()
@@ -661,7 +691,7 @@ async def _shutdown():
 # =========================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "roulette-bot", "version": "1.9.0"}
+    return {"ok": True, "service": "roulette-bot", "version": "1.9.1-ia"}
 
 @app.get("/health")
 async def health():
