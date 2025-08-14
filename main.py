@@ -35,7 +35,7 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.3.0")
+app = FastAPI(title="Roulette Signals Bot", version="1.5.0")
 ptb_app: Optional[Application] = None
 
 # =========================
@@ -81,6 +81,8 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
             "prev_pending": None,    # pending_bet antes de fechar
             "prev_streak": 0,        # streak antes do fechamento
         },
+        # Base da última ENTRADA (para justificar GALE no erro)
+        "last_entry_basis": {"kind": None}  # "book" | "quick" | None
     }
 
 def recompute_counts_from_history(state: Dict[str, Any]) -> None:
@@ -147,10 +149,10 @@ def quick_edge_two_dozens(
     state: Dict[str, Any],
     k: int = 12,
     need: int = 7
-) -> Tuple[bool, Tuple[str,str,str], str]:
+) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
     dzs = last_k_dozens(state, k)
     if len(dzs) < k:
-        return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente")
+        return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente", {"D1":0,"D2":0,"D3":0})
     c = {"D1":0, "D2":0, "D3":0}
     for d in dzs:
         c[d] += 1
@@ -158,8 +160,8 @@ def quick_edge_two_dozens(
     d1, d2 = ordered[0][0], ordered[1][0]
     excl = ({'D1','D2','D3'} - {d1,d2}).pop()
     if c[d1] + c[d2] >= need:
-        return (True, (d1,d2,excl), f"curto-prazo: {c[d1]}+{c[d2]} em {k}")
-    return (False, ("D1","D2","D3"), f"curto-prazo insuficiente: {c[d1]}+{c[d2]}<{need}")
+        return (True, (d1,d2,excl), f"curto-prazo: {c[d1]}+{c[d2]} em {k}", c)
+    return (False, ("D1","D2","D3"), f"curto-prazo insuficiente: {c[d1]}+{c[d2]}<{need}", c)
 
 def should_enter_book_style(
     state: Dict[str, Any],
@@ -206,6 +208,31 @@ def format_wait_text(mode: str) -> str:
         f"ℹ️ Envie o próximo número."
     )
 
+def gale_justification_text(state: Dict[str, Any], d1: str, d2: str) -> str:
+    basis = state.get("last_entry_basis", {"kind": None})
+    kind = basis.get("kind")
+    if kind == "quick":
+        k = basis.get("k", 12)
+        need = basis.get("need", 7)
+        counts = basis.get("counts", {"D1":0, "D2":0, "D3":0})
+        c1 = counts.get(d1, 0); c2 = counts.get(d2, 0)
+        return (
+            f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
+            f"🧾 Justificativa: no curto prazo, essas duas dúzias somam {c1+c2} ocorrências nos últimos {k} giros "
+            f"(limiar {need}). O erro pode ser variância; repetir **uma vez** é coerente."
+        )
+    elif kind == "book":
+        return (
+            f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
+            f"🧾 Justificativa: o padrão de setor ainda é dominante na janela recente; "
+            f"um erro isolado não invalida o viés. Repetir **uma vez** mantém a coerência do modelo."
+        )
+    else:
+        return (
+            f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
+            f"🧾 Justificativa: vantagem local recente; repetir **uma vez** reduz impacto da variância."
+        )
+
 def entry_keyboard() -> InlineKeyboardMarkup:
     # Botões somente quando HÁ ENTRADA
     return InlineKeyboardMarkup(
@@ -221,6 +248,15 @@ def entry_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
+def mode_keyboard() -> InlineKeyboardMarkup:
+    # Teclado só com modos (usado no /start)
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
+            InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador"),
+        ]]
+    )
+
 # =========================
 # Handlers
 # =========================
@@ -233,7 +269,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /modo agressivo ou /modo conservador.\n"
         "Envie números (0–36) a cada giro."
     )
-    await update.message.reply_text(text + f"\n🧩 Modo Ativado: {mode}")
+    await update.message.reply_text(
+        text + f"\n🧩 Modo Ativado: {mode}",
+        reply_markup=mode_keyboard()
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -362,14 +401,20 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s["wins"] += 1
             s["win_streak"] = s.get("win_streak", 0) + 1
             result_text = f"✅ Acertou ({n}{'' if dz is None else f' em {dz}'})."
+            s["gale_active"] = False
+            s["gale_level"] = 0
+            await update.message.reply_text(result_text + "\n" + stats_text(s))
         else:
             s["losses"] += 1
             s["win_streak"] = 0
             result_text = f"❌ Errou ({n}{'' if dz is None else f' em {dz}'})."
+            # Sugerir GALE 1 com justificativa
+            s["gale_active"] = True
+            s["gale_level"] = 1
+            await update.message.reply_text(result_text + "\n" + stats_text(s))
+            await update.message.reply_text(gale_justification_text(s, d1p, d2p))
+
         s["pending_bet"] = None
-        s["gale_active"] = False
-        s["gale_level"] = 0
-        await update.message.reply_text(result_text + "\n" + stats_text(s))
     else:
         # não houve fechamento nesse giro
         s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None, "prev_streak": s.get("win_streak", 0)}
@@ -388,15 +433,20 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 4) Gate “estilo livros” (qui-quadrado + setor quente)
     enter, _reason, rec = should_enter_book_style(s, MIN_SPINS, P_THRESHOLD)
+    entry_basis = {"kind": None}
 
     # 5) Fallback curto-prazo (rápido) se livros não acionou
     if not enter:
-        q_ok, q_rec, _q_reason = quick_edge_two_dozens(s, k=K, need=NEED)
+        q_ok, q_rec, _q_reason, counts = quick_edge_two_dozens(s, k=K, need=NEED)
         if q_ok:
             enter, rec = True, q_rec
+            entry_basis = {"kind": "quick", "k": K, "need": NEED, "counts": counts}
+    else:
+        entry_basis = {"kind": "book"}
 
     d1, d2, _excl = rec
     s["last_recommendation"] = rec
+    s["last_entry_basis"] = entry_basis
 
     mode = context.bot_data.get("MODE","conservador")
 
@@ -408,7 +458,7 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=entry_keyboard()
         )
         s["pending_bet"] = {"d1": d1, "d2": d2}
-        s["gale_active"] = True
+        s["gale_active"] = True  # indicador informativo (stake é decisão do usuário)
         s["gale_level"] = 0
     else:
         await update.message.reply_text(
@@ -417,7 +467,7 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback dos botões inline (somente exibidos na mensagem de ENTRAR)."""
+    """Callback dos botões inline (modos + corrigir/reset)."""
     await ensure_chat_state(update, context)
     s = context.chat_data["state"]
     query = update.callback_query
