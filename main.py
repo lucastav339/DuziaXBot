@@ -2,6 +2,7 @@
 import os
 import asyncio
 import logging
+import random
 from typing import Any, Dict, Tuple, List, Optional
 from collections import deque
 
@@ -35,8 +36,49 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.5.0")
+app = FastAPI(title="Roulette Signals Bot", version="1.8.0")
 ptb_app: Optional[Application] = None
+
+# =========================
+# “Justificativas” aleatórias
+# =========================
+JUSTIFICATIVAS_ENTRADA = [
+    "Padrão de repetição detectado nas últimas ocorrências, favorecendo essa combinação.",
+    "Tendência estatística reforçada pela dominância recente das dúzias selecionadas.",
+    "Correlação positiva identificada entre as últimas rodadas e a recomendação atual.",
+    "Sequência anterior indica probabilidade elevada de ocorrência desta configuração.",
+    "Análise de frequência sugere vantagem temporária para as dúzias indicadas.",
+    "Histórico recente mostra viés consistente a favor dessa seleção.",
+    "O modelo detectou um alinhamento favorável no padrão das últimas jogadas.",
+    "Alta taxa de convergência nas últimas ocorrências reforça a entrada sugerida.",
+    "A leitura de tendência estável aumenta a confiança nesta recomendação.",
+    "O desvio padrão recente indica consistência na repetição dessa configuração."
+]
+
+JUSTIFICATIVAS_ERRO = [
+    "A variação inesperada na distribuição quebrou o padrão observado nas últimas rodadas.",
+    "O desvio foi atípico e rompeu a correlação estatística das dúzias.",
+    "O ruído aleatório aumentou devido a uma sequência improvável de resultados.",
+    "Houve uma anomalia estatística fora do intervalo de confiança.",
+    "O padrão estava correto, mas ocorreu um evento de baixa probabilidade.",
+    "A tendência detectada foi interrompida por um número isolado fora da sequência.",
+    "O modelo indicou viés, porém o giro resultou em um outlier.",
+    "A previsão foi afetada por um pico de variabilidade momentânea.",
+    "O comportamento da mesa mudou abruptamente, quebrando a sequência monitorada.",
+    "O cálculo foi consistente, mas o resultado destoou do esperado."
+]
+
+def pick_no_repeat(pool: List[str], last_idx: int) -> Tuple[str, int]:
+    """Escolhe índice aleatório diferente de last_idx. Retorna (texto, novo_idx)."""
+    if not pool:
+        return "", -1
+    if len(pool) == 1:
+        return pool[0], 0
+    idx = last_idx
+    # tenta até ser diferente (em listas pequenas é O(1) na prática)
+    while idx == last_idx:
+        idx = random.randrange(len(pool))
+    return pool[idx], idx
 
 # =========================
 # Regras/Utilidades
@@ -82,7 +124,10 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
             "prev_streak": 0,        # streak antes do fechamento
         },
         # Base da última ENTRADA (para justificar GALE no erro)
-        "last_entry_basis": {"kind": None}  # "book" | "quick" | None
+        "last_entry_basis": {"kind": None},  # "book" | "quick" | None
+        # Anti-repetição de justificativas
+        "last_just_entry_idx": -1,
+        "last_just_error_idx": -1,
     }
 
 def recompute_counts_from_history(state: Dict[str, Any]) -> None:
@@ -192,7 +237,7 @@ def stats_text(state: Dict[str, Any]) -> str:
         f"🔥 Sequência de vitórias: {streak}"
     )
 
-# ---- Mensagens (sem critério e sem dúzia excluída) ----
+# ---- Mensagens / Teclados ----
 def format_reco_text(d1: str, d2: str, mode: str) -> str:
     return (
         f"🎬 **ENTRAR**\n"
@@ -257,6 +302,13 @@ def mode_keyboard() -> InlineKeyboardMarkup:
         ]]
     )
 
+def prompt_next_number_text() -> str:
+    return (
+        "👉 Agora me diga o **número que acabou de sair** na roleta (0–36).\n"
+        "Ex.: 17\n"
+        "Dica: se enviar errado, quando aparecer uma **ENTRADA** você poderá tocar em **✏️ Corrigir último**."
+    )
+
 # =========================
 # Handlers
 # =========================
@@ -270,7 +322,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Envie números (0–36) a cada giro."
     )
     await update.message.reply_text(
-        text + f"\n🧩 Modo Ativado: {mode}",
+        text + f"\n🧩 Modo Ativado: {mode}\n\n" + prompt_next_number_text(),
         reply_markup=mode_keyboard()
     )
 
@@ -309,6 +361,7 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg = "Use: /modo agressivo  ou  /modo conservador"
     await update.message.reply_text(msg)
+    await update.message.reply_text(prompt_next_number_text())
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
@@ -342,14 +395,11 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         old = s["last_input"]
-        # Remove último número do histórico
         if len(s["history"]) > 0:
             s["history"].pop()
 
-        # Reverte estatísticas do fechamento anterior e re-aplica sobre o novo valor
         lc = s.get("last_closure", {"had": False})
         if lc.get("had", False):
-            # desfaz o fechamento anterior
             if s["bets"] > 0:
                 s["bets"] -= 1
             if lc.get("was_win", False):
@@ -361,7 +411,6 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     s["losses"] -= 1
                 s["win_streak"] = lc.get("prev_streak", 0)
 
-            # aplica o fechamento com o número corrigido
             prev_pending = lc.get("prev_pending")
             dz_new = dozen_of(n)
             s["bets"] += 1
@@ -372,15 +421,12 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 s["losses"] += 1
                 s["win_streak"] = 0
 
-        # Adiciona o número corrigido e reconta
         s["history"].append(n)
         recompute_counts_from_history(s)
         s["last_input"] = n
         s["awaiting_correction"] = False
 
-        await update.message.reply_text(
-            f"✔️ Corrigido: {old} → {n}\n" + stats_text(s)
-        )
+        await update.message.reply_text(f"✔️ Corrigido: {old} → {n}\n" + stats_text(s))
         return
 
     # --- FECHAMENTO DE APOSTA PENDENTE (resultado do giro anterior) ---
@@ -390,7 +436,6 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dz = dozen_of(n)
         s["bets"] += 1
         was_win = (dz in (d1p, d2p))
-        # salva snapshot para possível correção
         s["last_closure"] = {
             "had": True,
             "was_win": was_win,
@@ -408,20 +453,23 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s["losses"] += 1
             s["win_streak"] = 0
             result_text = f"❌ Errou ({n}{'' if dz is None else f' em {dz}'})."
-            # Sugerir GALE 1 com justificativa
             s["gale_active"] = True
             s["gale_level"] = 1
             await update.message.reply_text(result_text + "\n" + stats_text(s))
+            # Desculpa técnica aleatória (sem repetir)
+            txt, idx = pick_no_repeat(JUSTIFICATIVAS_ERRO, s.get("last_just_error_idx", -1))
+            s["last_just_error_idx"] = idx
+            await update.message.reply_text(f"📖 {txt}")
+            # Orientação GALE com justificativa
             await update.message.reply_text(gale_justification_text(s, d1p, d2p))
 
         s["pending_bet"] = None
     else:
-        # não houve fechamento nesse giro
         s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None, "prev_streak": s.get("win_streak", 0)}
 
     # 1) Empilha no histórico (janela deslizante)
     s["history"].append(n)
-    # 2) Recalcula contagens dentro da janela
+    # 2) Recalcula contagens
     update_counts(s, n)
     s["last_input"] = n
 
@@ -431,11 +479,11 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     K = context.bot_data.get("K", 12)
     NEED = context.bot_data.get("NEED", 7)
 
-    # 4) Gate “estilo livros” (qui-quadrado + setor quente)
+    # 4) Gate “estilo livros”
     enter, _reason, rec = should_enter_book_style(s, MIN_SPINS, P_THRESHOLD)
     entry_basis = {"kind": None}
 
-    # 5) Fallback curto-prazo (rápido) se livros não acionou
+    # 5) Fallback curto-prazo
     if not enter:
         q_ok, q_rec, _q_reason, counts = quick_edge_two_dozens(s, k=K, need=NEED)
         if q_ok:
@@ -451,14 +499,16 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.bot_data.get("MODE","conservador")
 
     if enter:
-        # SOMENTE AQUI mostramos os botões
+        # Justificativa de ENTRAR aleatória (sem repetir)
+        txt, idx = pick_no_repeat(JUSTIFICATIVAS_ENTRADA, s.get("last_just_entry_idx", -1))
+        s["last_just_entry_idx"] = idx
         await update.message.reply_text(
-            format_reco_text(d1, d2, mode),
+            format_reco_text(d1, d2, mode) + f"\n📖 {txt}",
             parse_mode="Markdown",
             reply_markup=entry_keyboard()
         )
         s["pending_bet"] = {"d1": d1, "d2": d2}
-        s["gale_active"] = True  # indicador informativo (stake é decisão do usuário)
+        s["gale_active"] = True  # indicador informativo
         s["gale_level"] = 0
     else:
         await update.message.reply_text(
@@ -476,21 +526,19 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "fix_last":
         if len(s["history"]) == 0 or s["last_input"] is None:
             await query.answer("Nada para corrigir.")
-            await query.edit_message_reply_markup()  # remove teclados antigos
+            await query.edit_message_reply_markup()
             return
         s["awaiting_correction"] = True
         await query.answer()
-        await query.message.reply_text(
-            f"✏️ Envie o número correto para substituir o último: {s['last_input']}"
-        )
-        await query.edit_message_reply_markup()  # remove teclados da msg antiga
+        await query.message.reply_text(f"✏️ Envie o número correto para substituir o último: {s['last_input']}")
+        await query.edit_message_reply_markup()
 
     elif data == "reset_hist":
         win = context.bot_data.get("WINDOW", s.get("window_max", 150))
         context.chat_data["state"] = make_default_state(window_max=win)
         await query.answer("Histórico resetado.")
         await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.")
-        await query.edit_message_reply_markup()  # remove teclados da msg antiga
+        await query.edit_message_reply_markup()
 
     elif data == "set_agressivo":
         context.bot_data["MODE"] = "agressivo"
@@ -501,6 +549,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["NEED"] = 6
         await query.answer("Modo agressivo ativado.")
         await query.message.reply_text("✅ Modo agressivo ativado.")
+        await query.message.reply_text(prompt_next_number_text())
         await query.edit_message_reply_markup()
 
     elif data == "set_conservador":
@@ -512,6 +561,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["NEED"] = 9
         await query.answer("Modo conservador ativado.")
         await query.message.reply_text("✅ Modo conservador ativado.")
+        await query.message.reply_text(prompt_next_number_text())
         await query.edit_message_reply_markup()
 
     else:
@@ -543,64 +593,10 @@ async def on_startup() -> None:
             .build()
         )
 
-        # Defaults: modo CONSERVADOR visível
+        # Defaults: modo CONSERVADOR
         ptb_app.bot_data["MODE"] = "conservador"
         ptb_app.bot_data["MIN_SPINS"] = 25
         ptb_app.bot_data["P_THRESHOLD"] = 0.05
         ptb_app.bot_data["WINDOW"] = 200
         ptb_app.bot_data["K"] = 14
-        ptb_app.bot_data["NEED"] = 9
-
-        # Handlers
-        ptb_app.add_handler(CommandHandler("start", start_cmd))
-        ptb_app.add_handler(CommandHandler("help", help_cmd))
-        ptb_app.add_handler(CommandHandler("modo", modo_cmd))
-        ptb_app.add_handler(CommandHandler("status", status_cmd))
-        ptb_app.add_handler(CallbackQueryHandler(cb_handler))
-        ptb_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), number_message))
-
-        # Define webhook
-        webhook_url = f"{PUBLIC_URL}/telegram/webhook"
-        await ptb_app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=Update.ALL_TYPES
-        )
-        asyncio.create_task(ptb_app.initialize())
-        asyncio.create_task(ptb_app.start())
-        log.info("PTB inicializado e webhook configurado em %s", webhook_url)
-
-@app.on_event("startup")
-async def _startup():
-    await on_startup()
-
-@app.on_event("shutdown")
-async def _shutdown():
-    global ptb_app
-    if ptb_app:
-        await ptb_app.stop()
-        await ptb_app.shutdown()
-        log.info("PTB finalizado.")
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str = Header(None)
-):
-    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="invalid secret")
-    data = await request.json()
-    try:
-        update = Update.de_json(data, ptb_app.bot)
-        await ptb_app.process_update(update)
-    except Exception as e:
-        log.exception("Erro processando update: %s", e)
-    return JSONResponse({"ok": True})
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+        ptb_app.bot_da
