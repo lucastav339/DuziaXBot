@@ -35,7 +35,7 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.2.0")
+app = FastAPI(title="Roulette Signals Bot", version="1.3.0")
 ptb_app: Optional[Application] = None
 
 # =========================
@@ -190,30 +190,35 @@ def stats_text(state: Dict[str, Any]) -> str:
         f"🔥 Sequência de vitórias: {streak}"
     )
 
-def format_reco_text(d1: str, d2: str, excl: str, reason: str, mode: str, params: Dict[str, Any]) -> str:
+# ---- Mensagens (sem critério e sem dúzia excluída) ----
+def format_reco_text(d1: str, d2: str, mode: str) -> str:
     return (
         f"🎬 **ENTRAR**\n"
-        f"🎯 Recomendação: **{d1} + {d2}**  |  🚫 Excluída: {excl}\n"
-        f"📖 Critério: {reason}\n"
-        f"⚙️ Modo: {mode}  | p≤{params['P_THRESHOLD']}  | K={params['K']} NEED={params['NEED']}  | janela={params['WINDOW']}\n"
+        f"🎯 Recomendação: **{d1} + {d2}**\n"
+        f"🧩 Modo Ativado: {mode}\n"
         f"ℹ️ Envie o próximo número."
     )
 
-def format_wait_text(reason: str, mode: str, params: Dict[str, Any]) -> str:
+def format_wait_text(mode: str) -> str:
     return (
         f"⏳ **Aguardar**\n"
-        f"📖 Critério: {reason}\n"
-        f"⚙️ Modo: {mode}  | p≤{params['P_THRESHOLD']}  | K={params['K']} NEED={params['NEED']}  | janela={params['WINDOW']}\n"
+        f"🧩 Modo Ativado: {mode}\n"
         f"ℹ️ Envie o próximo número."
     )
 
 def entry_keyboard() -> InlineKeyboardMarkup:
     # Botões somente quando HÁ ENTRADA
     return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✏️ Corrigir último", callback_data="fix_last"),
-            InlineKeyboardButton("🗑️ Reset histórico", callback_data="reset_hist"),
-        ]]
+        [
+            [
+                InlineKeyboardButton("✏️ Corrigir último", callback_data="fix_last"),
+                InlineKeyboardButton("🗑️ Reset histórico", callback_data="reset_hist"),
+            ],
+            [
+                InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
+                InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador"),
+            ]
+        ]
     )
 
 # =========================
@@ -228,23 +233,21 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /modo agressivo ou /modo conservador.\n"
         "Envie números (0–36) a cada giro."
     )
-    await update.message.reply_text(text + f"\nModo atual: {mode}")
+    await update.message.reply_text(text + f"\n🧩 Modo Ativado: {mode}")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Comandos:\n"
         "/start – iniciar\n"
         "/modo agressivo|conservador – perfil de entradas\n"
-        "/status – ver parâmetros e última recomendação\n"
+        "/status – ver modo, última recomendação e estatísticas\n"
         "Envie números (0–36) como mensagens."
     )
 
 async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         cur = context.bot_data.get("MODE", "conservador")
-        await update.message.reply_text(
-            f"Modo atual: {cur}\nUse: /modo agressivo  ou  /modo conservador"
-        )
+        await update.message.reply_text(f"🧩 Modo Ativado: {cur}\nUse: /modo agressivo  ou  /modo conservador")
         return
 
     arg = context.args[0].lower().strip()
@@ -255,7 +258,7 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["WINDOW"] = 120
         context.bot_data["K"] = 10
         context.bot_data["NEED"] = 6
-        msg = "✅ Modo agressivo ativado: entradas mais frequentes."
+        msg = "✅ Modo agressivo ativado."
     elif arg in ("conservador", "safe"):
         context.bot_data["MODE"] = "conservador"
         context.bot_data["MIN_SPINS"] = 25
@@ -263,7 +266,7 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["WINDOW"] = 200
         context.bot_data["K"] = 14
         context.bot_data["NEED"] = 9
-        msg = "✅ Modo conservador ativado: entradas mais seletivas."
+        msg = "✅ Modo conservador ativado."
     else:
         msg = "Use: /modo agressivo  ou  /modo conservador"
     await update.message.reply_text(msg)
@@ -272,15 +275,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
     s = context.chat_data["state"]
     mode = context.bot_data.get("MODE","conservador")
-    params = {
-        "P_THRESHOLD": context.bot_data.get("P_THRESHOLD", 0.10),
-        "K": context.bot_data.get("K", 12),
-        "NEED": context.bot_data.get("NEED", 7),
-        "WINDOW": s["window_max"]
-    }
-    d1, d2, excl = s.get("last_recommendation", ("D1","D2","D3"))
-    reason = s.get("last_reason","—")
-    msg = format_reco_text(d1, d2, excl, reason, mode, params) + "\n" + stats_text(s)
+    d1, d2, _excl = s.get("last_recommendation", ("D1","D2","D3"))
+    msg = (
+        f"🧩 Modo Ativado: {mode}\n"
+        f"Última recomendação: {d1} + {d2}\n"
+        + stats_text(s)
+    )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,12 +316,10 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if lc.get("was_win", False):
                 if s["wins"] > 0:
                     s["wins"] -= 1
-                # ao desfazer uma vitória, volta o streak ao valor anterior salvo
                 s["win_streak"] = lc.get("prev_streak", 0)
             else:
                 if s["losses"] > 0:
                     s["losses"] -= 1
-                # ao desfazer uma derrota, o streak anterior era o salvo
                 s["win_streak"] = lc.get("prev_streak", 0)
 
             # aplica o fechamento com o número corrigido
@@ -349,10 +347,10 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- FECHAMENTO DE APOSTA PENDENTE (resultado do giro anterior) ---
     prev_pending = s["pending_bet"]
     if s.get("pending_bet"):
-        d1 = s["pending_bet"]["d1"]; d2 = s["pending_bet"]["d2"]
+        d1p = s["pending_bet"]["d1"]; d2p = s["pending_bet"]["d2"]
         dz = dozen_of(n)
         s["bets"] += 1
-        was_win = (dz in (d1, d2))
+        was_win = (dz in (d1p, d2p))
         # salva snapshot para possível correção
         s["last_closure"] = {
             "had": True,
@@ -389,25 +387,23 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     NEED = context.bot_data.get("NEED", 7)
 
     # 4) Gate “estilo livros” (qui-quadrado + setor quente)
-    enter, reason, rec = should_enter_book_style(s, MIN_SPINS, P_THRESHOLD)
+    enter, _reason, rec = should_enter_book_style(s, MIN_SPINS, P_THRESHOLD)
 
     # 5) Fallback curto-prazo (rápido) se livros não acionou
     if not enter:
-        q_ok, q_rec, q_reason = quick_edge_two_dozens(s, k=K, need=NEED)
+        q_ok, q_rec, _q_reason = quick_edge_two_dozens(s, k=K, need=NEED)
         if q_ok:
-            enter, reason, rec = True, q_reason, q_rec
+            enter, rec = True, q_rec
 
-    d1, d2, excl = rec
+    d1, d2, _excl = rec
     s["last_recommendation"] = rec
-    s["last_reason"] = reason
 
     mode = context.bot_data.get("MODE","conservador")
-    params = {"P_THRESHOLD": P_THRESHOLD, "K": K, "NEED": NEED, "WINDOW": s["window_max"]}
 
     if enter:
         # SOMENTE AQUI mostramos os botões
         await update.message.reply_text(
-            format_reco_text(d1, d2, excl, reason, mode, params),
+            format_reco_text(d1, d2, mode),
             parse_mode="Markdown",
             reply_markup=entry_keyboard()
         )
@@ -416,7 +412,7 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         s["gale_level"] = 0
     else:
         await update.message.reply_text(
-            format_wait_text(reason, mode, params),
+            format_wait_text(mode),
             parse_mode="Markdown"
         )
 
@@ -438,12 +434,36 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✏️ Envie o número correto para substituir o último: {s['last_input']}"
         )
         await query.edit_message_reply_markup()  # remove teclados da msg antiga
+
     elif data == "reset_hist":
         win = context.bot_data.get("WINDOW", s.get("window_max", 150))
         context.chat_data["state"] = make_default_state(window_max=win)
         await query.answer("Histórico resetado.")
         await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.")
         await query.edit_message_reply_markup()  # remove teclados da msg antiga
+
+    elif data == "set_agressivo":
+        context.bot_data["MODE"] = "agressivo"
+        context.bot_data["MIN_SPINS"] = 8
+        context.bot_data["P_THRESHOLD"] = 0.15
+        context.bot_data["WINDOW"] = 120
+        context.bot_data["K"] = 10
+        context.bot_data["NEED"] = 6
+        await query.answer("Modo agressivo ativado.")
+        await query.message.reply_text("✅ Modo agressivo ativado.")
+        await query.edit_message_reply_markup()
+
+    elif data == "set_conservador":
+        context.bot_data["MODE"] = "conservador"
+        context.bot_data["MIN_SPINS"] = 25
+        context.bot_data["P_THRESHOLD"] = 0.05
+        context.bot_data["WINDOW"] = 200
+        context.bot_data["K"] = 14
+        context.bot_data["NEED"] = 9
+        await query.answer("Modo conservador ativado.")
+        await query.message.reply_text("✅ Modo conservador ativado.")
+        await query.edit_message_reply_markup()
+
     else:
         await query.answer()
 
