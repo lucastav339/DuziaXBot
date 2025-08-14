@@ -36,7 +36,7 @@ if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.8.2")
+app = FastAPI(title="Roulette Signals Bot", version="1.9.0")
 ptb_app: Optional[Application] = None
 
 # =========================
@@ -313,15 +313,26 @@ def prompt_next_number_text() -> str:
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
-    mode = context.bot_data.get("MODE", "conservador")
+    mode_raw = context.bot_data.get("MODE", "conservador")
+    mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
+
     text = (
-        "🤖 Bot de sinais para **duas dúzias** (roleta europeia).\n"
-        "Use /modo agressivo ou /modo conservador.\n"
-        "Envie números (0–36) a cada giro."
+        "🎰 **Bem-vindo ao Assistente de Sinais de Roleta**\n\n"
+        "Eu sou o seu aliado para identificar **oportunidades** na roleta usando leitura de "
+        "tendência e padrões de jogo. 📊\n\n"
+        f"⚙ **Modo Ativado:** _{mode}_\n\n"
+        "📌 **Como funciona**\n"
+        "1️⃣ Escolha o modo: **Agressivo** 🎯 ou **Conservador** 🛡️\n"
+        "2️⃣ Informe o **último número** que saiu (0–36).\n"
+        "3️⃣ Aguarde minha análise para receber as recomendações.\n\n"
+        "💡 **Dica:** Enviou o número errado? Quando surgir uma **ENTRADA**, use **✏️ Corrigir último**.\n\n"
+        "Pronto para começar? Selecione o modo abaixo e envie o número que acabou de sair. ⬇️"
     )
+
     await update.message.reply_text(
-        text + f"\n🧩 Modo Ativado: {mode}\n\n" + prompt_next_number_text(),
-        reply_markup=mode_keyboard()
+        text,
+        reply_markup=mode_keyboard(),
+        parse_mode="Markdown"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,7 +347,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         cur = context.bot_data.get("MODE", "conservador")
-        await update.message.reply_text(f"🧩 Modo Ativado: {cur}\nUse: /modo agressivo  ou  /modo conservador")
+        cur_pt = "Agressivo" if cur.lower().startswith("agress") else "Conservador"
+        await update.message.reply_text(f"🧩 Modo Ativado: {cur_pt}\nUse: /modo agressivo  ou  /modo conservador")
         return
 
     arg = context.args[0].lower().strip()
@@ -364,7 +376,8 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
     s = context.chat_data["state"]
-    mode = context.bot_data.get("MODE","conservador")
+    mode_raw = context.bot_data.get("MODE","conservador")
+    mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
     d1, d2, _excl = s.get("last_recommendation", ("D1","D2","D3"))
     msg = (
         f"🧩 Modo Ativado: {mode}\n"
@@ -494,7 +507,8 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s["last_recommendation"] = rec
     s["last_entry_basis"] = entry_basis
 
-    mode = context.bot_data.get("MODE","conservador")
+    mode_raw = context.bot_data.get("MODE","conservador")
+    mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
 
     if enter:
         # Justificativa de ENTRAR aleatória (sem repetir)
@@ -647,7 +661,7 @@ async def _shutdown():
 # =========================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "roulette-bot", "version": "1.8.2"}
+    return {"ok": True, "service": "roulette-bot", "version": "1.9.0"}
 
 @app.get("/health")
 async def health():
