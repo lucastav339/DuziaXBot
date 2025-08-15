@@ -341,10 +341,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
 
     texto = (
-        "🤖 **iDozen — Assistente Inteligente de Duas Dúzias**\n\n"
-        "🧠 _Sistema ativo_. Pronto para analisar padrões e sugerir entradas com foco em **duas dúzias**.\n\n"
+        "🤖 ***iDozen* — Mestre das Dúzias**\n\n"
+        "✅ _Sistema ativo_. Algoritmos em execução..\n\n"
         f"🎛️ **Modo Ativado:** _{mode}_\n\n"
-        "### Como começar\n"
+        "*Como começar:*\n"
         "1️⃣ Selecione o **modo de operação**: **Agressivo** 🎯 ou **Conservador** 🛡️\n"
         "2️⃣ Envie o **último número** que saiu na roleta (**0–36**)\n"
         "3️⃣ Aguarde a **análise** e receba a **recomendação** quando houver oportunidade\n\n"
