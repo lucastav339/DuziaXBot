@@ -341,14 +341,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
 
     texto = (
-     "🤖 **iDozen — Mestre das Dúzias**\n\n"
-    f"🎛️ **Modo Ativado:** _{mode}_\n\n"
-    "📋 *Como começar:*\n\n"
-    "1️⃣ **Selecione o modo de operação.**  \n\n"
-    "  🎯 *Agressivo*    🛡️ *Conservador*  \n\n"
-    "2️⃣ *Envie o *número* que saiu na roleta.   \n"
-    "3️⃣ **Aguarde a análise.**\n\n"
-     
+   "🤖 <b>iDozen — Mestre das Dúzias</b>\n"
+    "<i>Sistema ativo. Algoritmos em execução.</i>\n\n"
+    f"🎛️ <b>Modo Ativado:</b> <i>{mode}</i>\n\n"
+    "📋 <b>Como começar</b>\n\n"
+    "1️⃣&nbsp;&nbsp;<b>Selecione o modo de operação</b>\n"
+    "&nbsp;&nbsp;&nbsp;&nbsp;🎯 <i>Agressivo</i> &nbsp;|&nbsp; 🛡️ <i>Conservador</i>\n"
+    "2️⃣&nbsp;&nbsp;<b>Envie o número</b> que saiu na roleta (0–36)\n"
+    "3️⃣&nbsp;&nbsp;<b>Aguarde a análise</b> e receba a recomendação"
     )
 
     await ia_send(update, context, texto, reply_markup=mode_keyboard(), parse_mode="Markdown")
