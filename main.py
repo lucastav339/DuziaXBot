@@ -344,11 +344,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     "🤖 **iDozen — Mestre das Dúzias**\n"
     "_Sistema ativo. Algoritmos em execução._\n\n"
     f"🎛️ **Modo Ativado:** _{mode}_\n\n"
-    "📋 **Como começar**\n"
-    "1️⃣ **Selecione o modo de operação**\n"
-    " "
+    "📋 **Como começar:**\n\n"
+    "1️⃣ **Selecione o modo de operação**\n\n"
     "  🎯 *Agressivo*   |   🛡️ *Conservador*\n"
-    " "    
     "2️⃣ **Envie o número**\n"
     "3️⃣ **Aguarde a análise**"
     )
