@@ -1,513 +1,660 @@
 import os
+import re
 import asyncio
+import datetime  # manter este import (não use "from datetime import ...")
 import logging
-import random
-from typing import Any, Dict, Tuple, List, Optional
-from collections import deque
+from html import escape as esc
 
-# ==========================================
-# MODO DE EXECUÇÃO
-# ==========================================
-RUN_MODE = os.getenv("RUN_MODE", "polling").lower()  # 'polling' (worker) ou 'webhook' (web)
-USE_WEBHOOK = RUN_MODE == "webhook"
+from aiohttp import web
+import redis.asyncio as redis
 
-# Mesmo em polling, expomos um FastAPI "stub" para não quebrar se alguém subir uvicorn por engano.
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse
-
-if USE_WEBHOOK:
-    app = FastAPI(title="Roulette Bot", version="2.0.0", description="Modo webhook (FastAPI + Telegram Webhook)")
-else:
-    app = FastAPI(title="Roulette Bot (stub)", version="2.0.0", description="Rodando em polling; este app é só um stub.")
-    @app.get("/")
-    async def root_stub():
-        return {"ok": True, "mode": "polling", "note": "O bot real está rodando via long polling (Background Worker)."}
-    @app.get("/health")
-    async def health_stub():
-        return {"ok": True}
-
-# ==========================================
-# LOG / CONFIG
-# ==========================================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("roulette-bot")
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
-PORT = int(os.getenv("PORT", "10000"))
-
-if not BOT_TOKEN:
-    log.error("BOT_TOKEN é obrigatório.")
-
-# ==========================================
-# TELEGRAM (python-telegram-bot v20+)
-# ==========================================
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
+from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, CallbackQueryHandler, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
+from telegram.error import BadRequest
 
-ptb_app: Optional[Application] = None  # global em webhook
+# =========================
+# CONFIG / ENV
+# =========================
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
+TG_PATH = (os.getenv("TG_PATH", "tg") or "tg").strip()
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
 
-# ==========================================
-# IA / TIPAGEM
-# ==========================================
-IA_MODE = True
+TRIAL_MAX_HITS = int((os.getenv("TRIAL_MAX_HITS") or "10").strip())
+SUB_DAYS = int((os.getenv("SUB_DAYS") or "7").strip())
+PAYWALL_OFF = ((os.getenv("PAYWALL_OFF") or "0").strip() == "1")
 
-async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_delay=0.25, max_delay=0.65):
-    if not IA_MODE:
-        return
+# ===== Parâmetros da ESTRATÉGIA ULTRA-CONSERVADORA =====
+# (você pode sobrescrever via ENV, se quiser)
+W = int((os.getenv("STRAT_W") or "36").strip())                 # janela de análise (reinicia no zero)
+Z_ALPHA = float((os.getenv("STRAT_Z_ALPHA") or "1.96").strip())  # z mínimo
+PVAL_MAX = float((os.getenv("STRAT_PVAL_MAX") or "0.05").strip())# p-valor máx no qui-quadrado (gl=2)
+CUSUM_H = float((os.getenv("STRAT_CUSUM_H") or "4").strip())     # limiar de disparo do CUSUM
+P1 = float((os.getenv("STRAT_P1") or "0.433").strip())           # hipótese de viés p1 (p0+Δ)
+P0 = 1.0/3.0
+
+# UI / limites
+MAX_NUMS_PER_MSG = int((os.getenv("MAX_NUMS_PER_MSG") or "40").strip())
+CHUNK = int((os.getenv("CHUNK") or "12").strip())
+MIN_GAP_SECONDS = float((os.getenv("MIN_GAP_SECONDS") or "0.35").strip())
+
+APP_VERSION = "unificado-v3.0-IA-ultra"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+log = logging.getLogger("main")
+
+# =========================
+# REDIS
+# =========================
+rds = None
+if REDIS_URL:
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        await asyncio.sleep(random.uniform(min_delay, max_delay))
-    except Exception:
-        pass
+        rds = redis.from_url(
+            REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
+            health_check_interval=30,
+            socket_keepalive=True
+        )
+    except Exception as e:
+        log.error(f"[BOOT] Falha ao inicializar Redis: {e}")
 
-def ia_wrap(text: str) -> str:
-    return text
+async def _safe_redis(coro, default=None, note=""):
+    try:
+        return await coro
+    except Exception as e:
+        log.error(f"[REDIS-FAIL] {note}: {e}")
+        return default
 
-async def ia_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
-    await ia_typing(update, context)
-    return await update.message.reply_text(ia_wrap(text), **kwargs)
+# =========================
+# ESTADO LOCAL
+# =========================
+# STATE mantém histórico em DÚZIAS ("D1","D2","D3").
+STATE = {}  # uid -> {hist, pred_queue, stats, last_touch, cusum, bankroll, stake}
 
-# ==========================================
-# LÓGICA DO BOT (duzias) — igual/estável
-# ==========================================
-JUSTIFICATIVAS_ENTRADA = [
-    "Padrão de repetição detectado nas últimas ocorrências, favorecendo essa combinação.",
-    "Tendência estatística reforçada pela dominância recente das dúzias selecionadas.",
-    "Correlação positiva identificada entre as últimas rodadas e a recomendação atual.",
-    "Sequência anterior indica probabilidade elevada de ocorrência desta configuração.",
-    "Análise de frequência sugere vantagem temporária para as dúzias indicadas.",
-    "Histórico recente mostra viés consistente a favor dessa seleção.",
-    "O modelo detectou um alinhamento favorável no padrão das últimas jogadas.",
-    "Alta taxa de convergência nas últimas ocorrências reforça a entrada sugerida.",
-    "A leitura de tendência estável aumenta a confiança nesta recomendação.",
-    "O desvio padrão recente indica consistência na repetição dessa configuração."
-]
-JUSTIFICATIVAS_ERRO = [
-    "A variação inesperada na distribuição quebrou o padrão observado nas últimas rodadas.",
-    "O desvio foi atípico e rompeu a correlação estatística das dúzias.",
-    "O ruído aleatório aumentou devido a uma sequência improvável de resultados.",
-    "Houve uma anomalia estatística fora do intervalo de confiança.",
-    "O padrão estava correto, mas ocorreu um evento de baixa probabilidade.",
-    "A tendência detectada foi interrompida por um número isolado fora da sequência.",
-    "O modelo indicou viés, porém o giro resultou em um outlier.",
-    "A previsão foi afetada por um pico de variabilidade momentânea.",
-    "O comportamento da mesa mudou abruptamente, quebrando a sequência monitorada.",
-    "O cálculo foi consistente, mas o resultado destoou do esperado."
-]
+def ensure_user(uid: int):
+    if uid not in STATE:
+        STATE[uid] = {
+            "hist": [],                 # sequência de 'D1'/'D2'/'D3' (zera ao sair 0)
+            "pred_queue": [],          # previsões pendentes (para apuração de acerto)
+            "stats": {"hits": 0, "misses": 0, "streak_hit": 0, "streak_miss": 0},
+            "last_touch": None,
+            "cusum": {"D1": 0.0, "D2": 0.0, "D3": 0.0},
+            "bankroll": float(os.getenv("BANKROLL_INIT", "50") or 50),
+            "stake": float(os.getenv("STAKE", "1") or 1),
+        }
 
-DOZENS = {"D1": set(range(1, 13)), "D2": set(range(13, 25)), "D3": set(range(25, 37))}
+# =========================
+# UTIL + ENVIO
+# =========================
+TELEGRAM_LIMIT = 4096
 
-def dozen_of(n: int) -> Optional[str]:
-    if 1 <= n <= 12: return "D1"
-    if 13 <= n <= 24: return "D2"
-    if 25 <= n <= 36: return "D3"
+def fit_telegram(html: str) -> str:
+    return html if len(html) <= TELEGRAM_LIMIT else html[:TELEGRAM_LIMIT-1] + "…"
+
+async def send_html(update: Update, html: str):
+    await asyncio.sleep(0.05)
+    try:
+        await update.message.reply_text(fit_telegram(html), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except BadRequest as e:
+        log.error(f"[SEND_HTML] BadRequest: {e}. Enviando versão 'plain'.")
+        try:
+            plain = re.sub(r"<[^>]*>", "", html)
+            await update.message.reply_text(fit_telegram(plain))
+        except Exception as e2:
+            log.error(f"[SEND_HTML] Fallback falhou: {e2}")
+
+def today() -> datetime.date:
+    return datetime.date.today()
+
+def pct(h, m) -> float:
+    t = h + m
+    return round((h * 100 / t), 1) if t else 0.0
+
+# =========================
+# MAPEAMENTO / HISTÓRICO
+# =========================
+
+def num_to_duzia(n: int):
+    if n == 0:
+        return None
+    if 1 <= n <= 12:
+        return "D1"
+    if 13 <= n <= 24:
+        return "D2"
+    if 25 <= n <= 36:
+        return "D3"
     return None
 
-def make_default_state(window_max: int = 150) -> Dict[str, Any]:
-    return {
-        "history": deque(maxlen=window_max),
-        "counts": [0]*37,
-        "total_spins": 0,
-        "gale_active": False,
-        "gale_level": 0,
-        "last_recommendation": ("D1","D2","D3"),
-        "last_reason": "",
-        "window_max": window_max,
-        "bets": 0, "wins": 0, "losses": 0, "win_streak": 0,
-        "pending_bet": None,
-        "awaiting_correction": False,
-        "last_input": None,
-        "last_closure": {"had": False, "was_win": False, "prev_pending": None, "prev_streak": 0},
-        "last_entry_basis": {"kind": None},
-        "last_just_entry_idx": -1,
-        "last_just_error_idx": -1,
+# aceita itens já em 'D1'/'D2'/'D3' ou números crus
+
+def _contagens_duzias(seq):
+    c = {"D1": 0, "D2": 0, "D3": 0}
+    for x in seq:
+        d = x if isinstance(x, str) and x.startswith("D") else num_to_duzia(int(x))
+        if d:
+            c[d] += 1
+    return c
+
+# =========================
+# FORMATAÇÃO
+# =========================
+
+def fmt_start(uid: int, hits_left: int, trial_max: int) -> str:
+    return f"""
+🤖 <b>IA Estratégica — Análise de Dúzias (Ultra)</b>
+━━━━━━━━━━━━━━━━━━
+🆔 <b>ID:</b> <code>{esc(str(uid))}</code>
+🆓 <b>Teste:</b> {hits_left} / {trial_max} acertos restantes
+━━━━━━━━━━━━━━━━━━
+📌 <b>Comandos</b>:
+<code>/status</code> — status | <code>/reset</code> — limpar histórico
+<code>/stake 1.00</code> — stake | <code>/bank 50</code> — banca
+<code>/ultra</code> — aplica thresholds ultra (padrão)
+━━━━━━━━━━━━━━━━━━
+💡 <i>Dica:</i> Envie números na ordem (ex.: 7 28 25 14). Zero (0) reinicia.
+""".strip()
+
+
+def fmt_paywall(link: str, days: int) -> str:
+    return f"""
+💳 <b>Seu teste grátis terminou</b>
+━━━━━━━━━━━━━━━━━━
+Para continuar usando o <b>Analista de Dúzias</b> por <b>{days} dias</b>:
+✅ Acesso ilimitado
+✅ Estratégia ultra-conservadora com filtros estatísticos
+✅ Justificativas técnicas
+
+➡️ <a href="{esc(link)}">Clique aqui para pagar</a>
+""".strip()
+
+
+def fmt_recommendation(duzias, justificativa, pendentes, hits_left, trial_max, banca, stake):
+    dz = " + ".join(f"<b>{d}</b>" for d in duzias)
+    return f"""
+🤖 <b>IA Estratégica — Sinal de Entrada</b>
+━━━━━━━━━━━━━━━━━━
+🎯 <b>Recomendação:</b> {dz}
+🧠 <b>Justificativa:</b>
+{esc(justificativa)}
+
+💰 <b>Stake:</b> R$ {stake:.2f} | <b>Banca:</b> R$ {banca:.2f}
+🔁 <b>Pendentes:</b> {pendentes}
+🆓 <b>Teste:</b> {hits_left}/{trial_max} acertos restantes
+━━━━━━━━━━━━━━━━━━
+""".strip()
+
+
+def fmt_no_recommendation(motivo: str, justificativa: str, hits_left: int, trial_max: int, banca: float):
+    return f"""
+🤖 <b>IA Estratégica — Monitoramento</b>
+━━━━━━━━━━━━━━━━━━
+⚠️ <b>Sem vantagem confirmada</b>
+📎 <b>Motivo técnico:</b> {esc(motivo)}
+🧠 <b>Raciocínio:</b>
+{esc(justificativa)}
+
+💰 <b>Banca:</b> R$ {banca:.2f}
+🆓 <b>Teste:</b> {hits_left}/{trial_max}
+━━━━━━━━━━━━━━━━━━
+""".strip()
+
+# =========================
+# TRIAL / PAYWALL
+# =========================
+PAYMENT_LINK = (os.getenv("PAYMENT_LINK") or "https://mpago.li/1cHXVHc").strip()
+
+async def get_active_until(user_id: int):
+    if not rds:
+        return None
+    try:
+        v = await rds.get(f"sub:{user_id}")
+        return datetime.date.fromisoformat(v) if v else None
+    except Exception:
+        return None
+
+async def set_active_days(user_id: int, days: int = SUB_DAYS):
+    if not rds:
+        return None
+    dt = today() + datetime.timedelta(days=days)
+    await _safe_redis(rds.set(f"sub:{user_id}", dt.isoformat()), note="set_active_days")
+    return dt
+
+async def get_trial_hits(user_id: int) -> int:
+    if not rds:
+        return 0
+    v = await _safe_redis(rds.get(f"trial:hits:{user_id}"), default="0", note="get_trial_hits")
+    try:
+        return int(v or 0)
+    except:  # noqa
+        return 0
+
+async def incr_trial_hits(user_id: int, inc: int = 1) -> int:
+    if not rds:
+        return 0
+    return await _safe_redis(rds.incrby(f"trial:hits:{user_id}", inc), default=0, note="incr_trial_hits")
+
+async def require_active_or_trial(update: Update) -> bool:
+    if PAYWALL_OFF:
+        return True
+    uid = update.effective_user.id
+    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@require")
+    if rds and paid is None:
+        log.warning("[PAYWALL-SOFT] Redis indisponível; liberando esta mensagem.")
+        return True
+    if paid and paid >= today():
+        return True
+    hits = await get_trial_hits(uid)
+    if hits < TRIAL_MAX_HITS:
+        return True
+    await send_html(update, fmt_paywall(PAYMENT_LINK, SUB_DAYS))
+    return False
+
+# =========================
+# ESTATÍSTICA — z, χ² (gl=2), Wilson, CUSUM
+# =========================
+
+def _wilson_lower(phat: float, w: int, z: float) -> float:
+    if w <= 0:
+        return 0.0
+    denom = 1.0 + (z*z)/w
+    center = phat + (z*z)/(2.0*w)
+    rad = z * ((phat*(1.0-phat)/w + (z*z)/(4.0*w*w)) ** 0.5)
+    return (center - rad) / denom
+
+
+def _chi2_p_gl2(chi2: float) -> float:
+    # gl=2 => p = exp(-chi2/2)
+    try:
+        import math
+        return math.exp(-chi2/2.0)
+    except Exception:
+        return 1.0
+
+
+def _window_counts(hist: list[str], w: int):
+    window = hist[-w:]
+    c = _contagens_duzias(window)
+    weff = len(window)
+    return window, c, weff
+
+
+def _z_scores(c: dict, w_eff: int):
+    import math
+    if w_eff <= 0:
+        return {"D1": 0.0, "D2": 0.0, "D3": 0.0}
+    denom = (P0*(1.0-P0)/w_eff) ** 0.5
+    return {d: (c[d]/w_eff - P0)/denom for d in ("D1","D2","D3")}
+
+
+def _has_seq_or_3in4(hist: list[str], target: str) -> bool:
+    if len(hist) >= 3 and all(d == target for d in hist[-3:]):
+        return True
+    if len(hist) >= 4 and sum(1 for d in hist[-4:] if d == target) >= 3:
+        return True
+    return False
+
+
+def _update_cusum(cusum: dict, outcome_duzia: str | None, p1: float = P1) -> dict:
+    import math
+    out = {}
+    for d in ("D1","D2","D3"):
+        X = 1 if (outcome_duzia == d) else 0
+        inc = (math.log(p1/P0) if X else math.log((1.0-p1)/(1.0-P0)))
+        out[d] = max(0.0, cusum.get(d, 0.0) + inc)
+    return out
+
+# =========================
+# NÚCLEO DA ESTRATÉGIA (Modo 1 dúzia / Modo 2 dúzias)
+# =========================
+
+def decidir_1_duzia(state: dict):
+    """Retorna (ok, duzia, dbg, motivo). Usa filtros: z/Wilson + χ², sequência e CUSUM."""
+    hist = state["hist"]
+    if not hist:
+        return False, None, {}, "Histórico insuficiente"
+
+    window, C, weff = _window_counts(hist, W)
+    Z = _z_scores(C, weff)
+    # Qui-quadrado
+    exp = weff/3.0 if weff>0 else 0.0
+    chi2 = sum(((C[d] - exp)**2)/exp for d in ("D1","D2","D3")) if weff>0 else 0.0
+    pval = _chi2_p_gl2(chi2)
+
+    # D* = maior z
+    d_star = max(("D1","D2","D3"), key=lambda d: Z[d])
+    phat_star = (C[d_star]/weff) if weff>0 else 0.0
+    wilsonL = _wilson_lower(phat_star, weff, Z_ALPHA)
+
+    stat_ok = ((Z[d_star] >= Z_ALPHA and pval < PVAL_MAX) or (wilsonL > P0))
+    seq_ok = _has_seq_or_3in4(hist, d_star)
+    cusum_ok = (state["cusum"].get(d_star, 0.0) > CUSUM_H)
+
+    dbg = {
+        "weff": weff, "C": C, "Z": {k: round(v,3) for k,v in Z.items()},
+        "chi2": round(chi2,3), "p": round(pval,4), "d*": d_star,
+        "wilsonL": round(wilsonL,4), "cusum": {k: round(v,3) for k,v in state["cusum"].items()},
+        "seq": seq_ok, "stat": stat_ok, "cusum_ok": cusum_ok
     }
 
-def recompute_counts_from_history(state: Dict[str, Any]) -> None:
-    counts = [0]*37; total = 0
-    for x in state["history"]:
-        if 0 <= x <= 36:
-            counts[x] += 1; total += 1
-    state["counts"] = counts; state["total_spins"] = total
+    if stat_ok and seq_ok and cusum_ok:
+        return True, d_star, dbg, "Apto"
 
-def update_counts(state: Dict[str, Any], _new_number: int) -> None:
-    recompute_counts_from_history(state)
+    # Motivo detalhado
+    if not stat_ok:
+        return False, None, dbg, "Sem confirmação estatística (z/Wilson + χ²)"
+    if not seq_ok:
+        return False, None, dbg, "Sem sequência (3 seguidas ou 3 em 4)"
+    return False, None, dbg, "CUSUM abaixo do limiar"
 
-def chi_square_bias(counts: List[int], total: int) -> Tuple[float, float]:
-    if total <= 0: return 0.0, 1.0
-    exp = total / 37.0
-    chi2 = 0.0
-    for c in counts:
-        chi2 += (c - exp) ** 2 / exp
-    import math
-    df = 36.0
-    if chi2 <= 0: return 0.0, 1.0
-    z = ((chi2/df)**(1.0/3.0) - (1 - 2/(9*df))) / math.sqrt(2/(9*df))
-    p = 1 - 0.5*(1 + math.erf(z / math.sqrt(2)))
-    p = max(0.0, min(1.0, p))
-    return chi2, p
 
-def find_hottest_sector(counts: List[int], window_len: int = 12) -> List[int]:
-    n = 37
-    if window_len >= n: return list(range(n))
-    extended = counts + counts[:window_len-1]
-    max_sum = sum(extended[:window_len]); best_start = 0; cur_sum = max_sum
-    for i in range(1, n):
-        cur_sum += extended[i+window_len-1] - extended[i-1]
-        if cur_sum > max_sum: max_sum = cur_sum; best_start = i
-    return [(best_start + j) % n for j in range(window_len)]
+def decidir_2_duzias(state: dict):
+    """Retorna (ok, duzias_list, dbg, motivo). Critério: χ² significativo + (seq OU cusum) em pelo menos 1 das duas com maior z."""
+    hist = state["hist"]
+    if not hist:
+        return False, [], {}, "Histórico insuficiente"
 
-def sector_to_two_dozens(sector: List[int]) -> Tuple[str, str, str]:
-    hits = {"D1":0,"D2":0,"D3":0}
-    for p in sector:
-        d = dozen_of(p)
-        if d: hits[d] += 1
-    ordered = sorted(hits.items(), key=lambda kv:(-kv[1], kv[0]))
-    d1, d2 = ordered[0][0], ordered[1][0]
-    excl = ({'D1','D2','D3'} - {d1,d2}).pop()
-    return d1, d2, excl
+    window, C, weff = _window_counts(hist, W)
+    Z = _z_scores(C, weff)
+    exp = weff/3.0 if weff>0 else 0.0
+    chi2 = sum(((C[d] - exp)**2)/exp for d in ("D1","D2","D3")) if weff>0 else 0.0
+    pval = _chi2_p_gl2(chi2)
 
-def last_k_dozens(state: Dict[str, Any], k: int) -> List[str]:
-    seq = list(state["history"])[-k:]
-    return [dozen_of(x) for x in seq if 0 <= x <= 36 and dozen_of(x) is not None]
+    orden = sorted(("D1","D2","D3"), key=lambda d: Z[d], reverse=True)
+    d1, d2, d3 = orden[0], orden[1], orden[2]
 
-def quick_edge_two_dozens(state: Dict[str, Any], k: int = 12, need: int = 7) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
-    dzs = last_k_dozens(state, k)
-    if len(dzs) < k:
-        return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente", {"D1":0,"D2":0,"D3":0})
-    c = {"D1":0, "D2":0, "D3":0}
-    for d in dzs: c[d] += 1
-    ordered = sorted(c.items(), key=lambda kv:(-kv[1], kv[0]))
-    d1, d2 = ordered[0][0], ordered[1][0]
-    excl = ({'D1','D2','D3'} - {d1,d2}).pop()
-    if c[d1] + c[d2] >= need:
-        return (True, (d1,d2,excl), f"curto-prazo: {c[d1]}+{c[d2]} em {k}", c)
-    return (False, ("D1","D2","D3"), f"curto-prazo insuficiente: {c[d1]}+{c[d2]}<{need}", c)
+    # Pelo menos uma das duas deve cumprir (seq OU cusum)
+    cond_d1 = _has_seq_or_3in4(hist, d1) or (state["cusum"].get(d1,0.0) > CUSUM_H)
+    cond_d2 = _has_seq_or_3in4(hist, d2) or (state["cusum"].get(d2,0.0) > CUSUM_H)
 
-def should_enter_book_style(state: Dict[str, Any], min_spins: int, p_threshold: float) -> Tuple[bool, str, Tuple[str,str,str]]:
-    total = state.get("total_spins", 0)
-    if total < min_spins:
-        return (False, f"amostra insuficiente ({total}/{min_spins})", ("D1","D2","D3"))
-    _, p = chi_square_bias(state["counts"], total)
-    if p > p_threshold:
-        return (False, f"sem viés detectável (p≈{p:.3f})", ("D1","D2","D3"))
-    sector = find_hottest_sector(state["counts"], window_len=12)
-    d1, d2, excl = sector_to_two_dozens(sector)
-    return (True, "viés detectado", (d1,d2,excl))
+    stat_ok = (pval < PVAL_MAX)  # χ² confirma desequilíbrio global
+    any_confirm = (cond_d1 or cond_d2)
 
-def stats_text(state: Dict[str, Any]) -> str:
-    b = state.get("bets", 0); w = state.get("wins", 0); l = state.get("losses", 0)
-    rate = (w / b * 100) if b else 0.0; streak = state.get("win_streak", 0)
-    return (f"📊 Estatísticas\n"
-            f"✅ Acertos: {w}\n"
-            f"❌ Erros: {l}\n"
-            f"📈 Taxa: {rate:.1f}%  (em {b} apostas)\n"
-            f"🔥 Sequência de vitórias: {streak}")
+    dbg = {
+        "weff": weff, "C": C, "Z": {k: round(v,3) for k,v in Z.items()},
+        "chi2": round(chi2,3), "p": round(pval,4), "top2": [d1, d2], "excl": d3,
+        "cusum": {k: round(v,3) for k,v in state["cusum"].items()},
+        "d1_seq/cusum": cond_d1, "d2_seq/cusum": cond_d2
+    }
 
-def format_reco_text(d1: str, d2: str, mode: str) -> str:
-    return (f"🎬 **ENTRAR**\n"
-            f"🎯 Recomendação: **{d1} + {d2}**\n"
-            f"🧩 Modo Ativado: {mode}\n"
-            f"ℹ️ Envie o próximo número.")
+    if stat_ok and any_confirm:
+        return True, [d1, d2], dbg, "Apto"
 
-def format_wait_text(mode: str) -> str:
-    return (f"⏳ **Aguardar**\n"
-            f"🧩 Modo Ativado: {mode}\n"
-            f"ℹ️ Envie o próximo número.")
+    if not stat_ok:
+        return False, [], dbg, "χ² não significativo (p ≥ limiar)"
+    return False, [], dbg, "Sem sequência/CUSUM nas candidatas"
 
-def gale_justification_text(state: Dict[str, Any], d1: str, d2: str) -> str:
-    basis = state.get("last_entry_basis", {"kind": None})
-    kind = basis.get("kind")
-    if kind == "quick":
-        k = basis.get("k", 12); need = basis.get("need", 7)
-        counts = state.get("last_entry_basis", {}).get("counts", {"D1":0, "D2":0, "D3":0})
-        c1 = counts.get(d1, 0); c2 = counts.get(d2, 0)
-        return (f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
-                f"🧾 Justificativa: no curto prazo, somam {c1+c2} ocorrências nos últimos {k} giros "
-                f"(limiar {need}). Repetir **uma vez** é coerente.")
-    elif kind == "book":
-        return (f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
-                f"🧾 Justificativa: o setor dominante ainda prevalece — erro isolado = variância.")
-    else:
-        return (f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
-                f"🧾 Justificativa: vantagem local recente; repetir **uma vez** reduz variância.")
+# =========================
+# SCORE / PREVISÕES
+# =========================
+async def score_predictions(uid: int, nums: list[int]) -> bool:
+    """Apura acertos/erros consumindo a fila; retorna True se o trial estourou aqui."""
+    st = STATE[uid]
+    q = st["pred_queue"]
+    s = st["stats"]
 
-def entry_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Corrigir último", callback_data="fix_last"),
-         InlineKeyboardButton("🗑️ Reset histórico", callback_data="reset_hist")],
-        [InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
-         InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador")]
-    ])
+    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@score")
+    on_trial = (not PAYWALL_OFF) and (not paid) and rds
+    hit_limit_now = False
 
-def mode_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
-        InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador"),
-    ]])
-
-def prompt_next_number_text() -> str:
-    return ("👉 Envie o **número que saiu** na roleta (0–36). Ex.: 17\n"
-            "Dica: se enviar errado, toque em **✏️ Corrigir último** após a próxima entrada.")
-
-# ==========================================
-# HANDLERS
-# ==========================================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_chat_state(update, context)
-    mode_raw = context.bot_data.get("MODE", "conservador")
-    mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
-    texto = ("🤖 *iDozen — Mestre das Dúzias*\n\n"
-             "📋 *Como começar:*\n\n"
-             "1️⃣ **Selecione o modo de operação:**\n\n"
-             "  🎯 *Agressivo*   |   🛡️ *Conservador*\n\n"
-             "2️⃣ **Envie o número.**\n\n"
-             "3️⃣ **Aguarde a análise.**\n\n"
-             f"🎛️ **Modo Ativado:** _{mode}_\n\n")
-    await ia_send(update, context, texto, reply_markup=mode_keyboard(), parse_mode="Markdown")
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ia_send(update, context,
-        "Comandos:\n"
-        "/start – iniciar\n"
-        "/modo agressivo|conservador – perfil de entradas\n"
-        "/status – ver modo, última recomendação e estatísticas\n"
-        "Envie números (0–36) como mensagens."
-    )
-
-async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        cur = context.bot_data.get("MODE", "conservador")
-        cur_pt = "Agressivo" if cur.lower().startswith("agress") else "Conservador"
-        await ia_send(update, context, f"🧩 Modo Ativado: {cur_pt}\nUse: /modo agressivo  ou  /modo conservador")
-        return
-    arg = context.args[0].lower().strip()
-    if arg in ("agressivo", "agro"):
-        context.bot_data["MODE"] = "agressivo"
-        context.bot_data["MIN_SPINS"] = 8; context.bot_data["P_THRESHOLD"] = 0.15
-        context.bot_data["WINDOW"] = 120; context.bot_data["K"] = 10; context.bot_data["NEED"] = 6
-        msg = "✅ Modo agressivo ativado."
-    elif arg in ("conservador", "safe"):
-        context.bot_data["MODE"] = "conservador"
-        context.bot_data["MIN_SPINS"] = 25; context.bot_data["P_THRESHOLD"] = 0.05
-        context.bot_data["WINDOW"] = 200; context.bot_data["K"] = 14; context.bot_data["NEED"] = 9
-        msg = "✅ Modo conservador ativado."
-    else:
-        msg = "Use: /modo agressivo  ou  /modo conservador"
-    await ia_send(update, context, msg)
-    await ia_send(update, context, prompt_next_number_text())
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_chat_state(update, context)
-    s = context.chat_data["state"]
-    mode_raw = context.bot_data.get("MODE","conservador")
-    mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
-    d1, d2, _excl = s.get("last_recommendation", ("D1","D2","D3"))
-    msg = (f"🧩 Modo Ativado: {mode}\n"
-           f"Última recomendação: {d1} + {d2}\n" + stats_text(s))
-    await ia_send(update, context, msg, parse_mode="Markdown")
-
-async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_chat_state(update, context)
-    s = context.chat_data["state"]
-
-    text = (update.message.text or "").strip()
-    if not text.isdigit(): return
-    n = int(text)
-    if n < 0 or n > 36:
-        await ia_send(update, context, "Envie números entre 0 e 36."); return
-
-    # Fechar aposta anterior (se havia)
-    prev_pending = s["pending_bet"]
-    if prev_pending:
-        dz = dozen_of(n); s["bets"] += 1
-        was_win = (dz in (prev_pending["d1"], prev_pending["d2"]))
-        s["last_closure"] = {"had": True, "was_win": was_win, "prev_pending": prev_pending, "prev_streak": s.get("win_streak", 0)}
-        if was_win:
-            s["wins"] += 1; s["win_streak"] = s.get("win_streak", 0) + 1
-            await ia_send(update, context, f"✅ Acertou ({n}{'' if dz is None else f' em {dz}'}).\n" + stats_text(s))
-            s["gale_active"] = False; s["gale_level"] = 0
+    for n in nums:
+        d = num_to_duzia(n)
+        if d is None:
+            # zero: não apura; apenas continua
+            pass
+        if not q:
+            # nada a apurar
+            continue
+        pred = q.pop(0)
+        hit = (d in pred.get("duzias", []))
+        if hit:
+            s["hits"] += 1; s["streak_hit"] += 1; s["streak_miss"] = 0
+            if on_trial and TRIAL_MAX_HITS > 0:
+                new_hits = await _safe_redis(incr_trial_hits(uid, 1), default=0, note="incr_trial_hits")
+                if new_hits >= TRIAL_MAX_HITS:
+                    hit_limit_now = True
         else:
-            s["losses"] += 1; s["win_streak"] = 0
-            await ia_send(update, context, f"❌ Errou ({n}{'' if dz is None else f' em {dz}'}).\n" + stats_text(s))
-            s["gale_active"] = True; s["gale_level"] = 1
-            await ia_send(update, context, random.choice(JUSTIFICATIVAS_ERRO))
-            await ia_send(update, context, gale_justification_text(s, prev_pending["d1"], prev_pending["d2"]))
-        s["pending_bet"] = None
+            s["misses"] += 1; s["streak_miss"] += 1; s["streak_hit"] = 0
+    return hit_limit_now
+
+# =========================
+# HANDLERS — COMANDOS
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user.id)
+    uid = update.effective_user.id
+    hits = await get_trial_hits(uid) if rds else 0
+    hits_left = max(TRIAL_MAX_HITS - hits, 0)
+    await send_html(update, fmt_start(uid, hits_left, TRIAL_MAX_HITS))
+
+async def cmd_assinar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_html(update, fmt_paywall(PAYMENT_LINK, SUB_DAYS))
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    paid = await _safe_redis(get_active_until(uid), default=None, note="get_active_until@status")
+    if paid and paid >= today():
+        html = f"""
+🤖 <b>IA Estratégica — Status</b>
+━━━━━━━━━━━━━━━━━━
+🟢 <b>Acesso ativo</b> até <b>{paid.strftime('%d/%m/%Y')}</b>.
+""".strip()
+        await send_html(update, html)
+        return
+    hits = await get_trial_hits(uid)
+    hits_left = max(TRIAL_MAX_HITS - (hits or 0), 0)
+    html = f"""
+🤖 <b>IA Estratégica — Status</b>
+━━━━━━━━━━━━━━━━━━
+🆓 <b>Em teste</b> — {hits_left} / {TRIAL_MAX_HITS} acertos restantes.
+""".strip()
+    await send_html(update, html)
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_active_or_trial(update):
+        return
+    ensure_user(update.effective_user.id)
+    st = STATE[update.effective_user.id]
+    st["hist"] = []
+    st["pred_queue"] = []
+    st["cusum"] = {"D1":0.0, "D2":0.0, "D3":0.0}
+    await send_html(update, "🧹 Histórico e CUSUM zerados.")
+
+async def cmd_stake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_active_or_trial(update):
+        return
+    ensure_user(update.effective_user.id)
+    st = STATE[update.effective_user.id]
+    try:
+        value = float(context.args[0])
+        st["stake"] = max(0.01, value)
+        await send_html(update, f"Stake ajustada para R$ {st['stake']:.2f}.")
+    except Exception:
+        await send_html(update, "Uso: /stake 1.00")
+
+async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_active_or_trial(update):
+        return
+    ensure_user(update.effective_user.id)
+    st = STATE[update.effective_user.id]
+    try:
+        value = float(context.args[0])
+        st["bankroll"] = max(0.0, value)
+        await send_html(update, f"Banca ajustada para R$ {st['bankroll']:.2f}.")
+    except Exception:
+        await send_html(update, "Uso: /bank 50")
+
+async def cmd_ultra(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_active_or_trial(update):
+        return
+    await send_html(update, f"Modo <b>ULTRA</b> ativo: W={W}, z≥{Z_ALPHA}, p<{PVAL_MAX}, CUSUM h={CUSUM_H}, p1={P1}.")
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_active_or_trial(update):
+        return
+    ensure_user(update.effective_user.id)
+    s = STATE[update.effective_user.id]["stats"]
+    p = len(STATE[update.effective_user.id]["pred_queue"])
+    await send_html(update, (
+        "📈 <b>IA Estratégica — Resultados</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"• ✅ Acertos: <b>{s['hits']}</b>\n"
+        f"• ❌ Erros: <b>{s['misses']}</b>\n"
+        f"• 🎯 Taxa: <b>{pct(s['hits'], s['misses'])}%</b>\n"
+        f"• 🔁 Pendentes: <b>{p}</b>"
+    ))
+
+# =========================
+# HANDLER PRINCIPAL (TEXTO)
+# =========================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user.id)
+    uid = update.effective_user.id
+
+    # Anti-flood por usuário
+    now = datetime.datetime.utcnow()
+    last = STATE[uid]["last_touch"]
+    if last and (now - last).total_seconds() < MIN_GAP_SECONDS:
+        return
+    STATE[uid]["last_touch"] = now
+
+    txt = (update.message.text or "").strip()
+    nums = [int(x) for x in re.findall(r"\d+", txt)]
+    if not nums:
+        await send_html(update, "Envie números (ex.: <code>32 19 33 12 8</code>).")
+        return
+
+    # 1) Apura previsões pendentes
+    nums = nums[:MAX_NUMS_PER_MSG]
+    hit_limit_now = False
+    for i in range(0, len(nums), CHUNK):
+        bloc = nums[i:i+CHUNK]
+        if await score_predictions(uid, bloc):
+            hit_limit_now = True
+        await asyncio.sleep(0.05)
+    if hit_limit_now and not PAYWALL_OFF:
+        await send_html(update, fmt_paywall(PAYMENT_LINK, SUB_DAYS))
+        return
+
+    # 2) Paywall/trial
+    if not await require_active_or_trial(update):
+        return
+
+    # 3) Atualiza histórico (em dúzias), reseta no zero e atualiza CUSUM
+    st = STATE[uid]
+    for n in nums:
+        d = num_to_duzia(n)
+        if d is None:  # zero
+            st["hist"] = []
+            st["cusum"] = {"D1":0.0, "D2":0.0, "D3":0.0}
+        else:
+            st["hist"].append(d)
+            st["hist"] = st["hist"][-max(W*5, 200):]  # histórico longo suficiente (capado)
+            st["cusum"] = _update_cusum(st["cusum"], d, P1)
+
+    # 4) Rodar decisão (modo 1 dúzia por padrão). Quer 2 dúzias? Altere abaixo ou crie comando.
+    ok1, d1, dbg1, motivo1 = decidir_1_duzia(st)
+
+    hits = await get_trial_hits(uid) if rds else 0
+    hits_left = max(TRIAL_MAX_HITS - hits, 0)
+
+    if not ok1:
+        # mensagem técnica
+        jus = (
+            f"Janela efetiva={dbg1.get('weff',0)}; Contagens={dbg1.get('C')}; z={dbg1.get('Z')}\n"
+            f"χ²={dbg1.get('chi2')} (p={dbg1.get('p')}); WilsonL={dbg1.get('wilsonL')}; "
+            f"CUSUM={dbg1.get('cusum')}; Seq={dbg1.get('seq')}"
+        )
+        await send_html(update, fmt_no_recommendation(motivo1, jus, hits_left, TRIAL_MAX_HITS, st["bankroll"]))
+        return
+
+    # Registrar previsão pendente: apostar na dúzia d1 no próximo giro
+    st["pred_queue"].append({"duzias": [d1]})
+    pend = len(st["pred_queue"])
+
+    jus = (
+        f"D*={d1} com z={dbg1['Z'][d1]:.3f}; χ²={dbg1['chi2']} (p={dbg1['p']}). "
+        f"WilsonL={dbg1['wilsonL']}; Seq={dbg1['seq']}; CUSUM={dbg1['cusum'][d1]:.3f}"
+    )
+    await send_html(update, fmt_recommendation([d1], jus, pend, hits_left, TRIAL_MAX_HITS, st["bankroll"], st["stake"]))
+
+# =========================
+# AIOHTTP + TELEGRAM (WEBHOOK)
+# =========================
+application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# Comandos
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("assinar", cmd_assinar))
+application.add_handler(CommandHandler("status", cmd_status))
+application.add_handler(CommandHandler("reset", cmd_reset))
+application.add_handler(CommandHandler("stats", cmd_stats))
+application.add_handler(CommandHandler("stake", cmd_stake))
+application.add_handler(CommandHandler("bank", cmd_bank))
+application.add_handler(CommandHandler("ultra", cmd_ultra))
+
+# Texto
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+# Web app
+aio = web.Application()
+
+async def tg_handler(request: web.Request):
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return web.Response(text="ok")
+
+async def payments_handler(request: web.Request):
+    data = await request.json()
+    if data.get("status") == "paid" and "user_id" in data:
+        uid = int(data["user_id"])
+        dt = await set_active_days(uid, SUB_DAYS)
+        return web.json_response({"ok": True, "active_until": dt.isoformat() if dt else None})
+    return web.json_response({"ok": False})
+
+async def health_handler(request: web.Request):
+    return web.Response(text="ok")
+
+async def root_handler(request: web.Request):
+    return web.Response(text="ok")
+
+aio.router.add_post(f"/{TG_PATH}", tg_handler)
+aio.router.add_post("/payments/webhook", payments_handler)
+aio.router.add_get("/health", health_handler)
+aio.router.add_get("/", root_handler)
+
+async def on_startup(app: web.Application):
+    if (not TELEGRAM_TOKEN) or ("\n" in TELEGRAM_TOKEN) or (" " in TELEGRAM_TOKEN):
+        raise RuntimeError("TELEGRAM_TOKEN inválido (vazio, com espaço ou quebra de linha). Corrija nas Environment Variables.")
+    print(f"🚀 {APP_VERSION} | PUBLIC_URL={PUBLIC_URL} | TG_PATH=/{TG_PATH} | TRIAL_MAX_HITS={TRIAL_MAX_HITS}")
+    await application.initialize()
+    await application.start()
+    if PUBLIC_URL:
+        hook_url = f"{PUBLIC_URL}/{TG_PATH}"
+        await application.bot.set_webhook(url=hook_url, drop_pending_updates=True)
+        print(f"✅ Webhook setado em {hook_url}")
     else:
-        s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None, "prev_streak": s.get("win_streak", 0)}
+        print("⚠️ Defina PUBLIC_URL para habilitar o webhook.")
 
-    # Atualiza histórico
-    s["history"].append(n); update_counts(s, n); s["last_input"] = n
+async def on_cleanup(app: web.Application):
+    try:
+        await application.bot.delete_webhook()
+    except Exception:
+        pass
+    await application.stop()
+    await application.shutdown()
 
-    # Parâmetros do modo
-    MIN_SPINS = context.bot_data.get("MIN_SPINS", 15)
-    P_THRESHOLD = context.bot_data.get("P_THRESHOLD", 0.10)
-    K = context.bot_data.get("K", 12); NEED = context.bot_data.get("NEED", 7)
+aio.on_startup.append(on_startup)
+aio.on_cleanup.append(on_cleanup)
 
-    # Gate "livros"
-    enter, _reason, rec = should_enter_book_style(s, MIN_SPINS, P_THRESHOLD)
-    entry_basis = {"kind": None}
-    if not enter:
-        q_ok, q_rec, _q_reason, counts = quick_edge_two_dozens(s, k=K, need=NEED)
-        if q_ok:
-            enter, rec = True, q_rec
-            entry_basis = {"kind": "quick", "k": K, "need": NEED, "counts": counts}
-    else:
-        entry_basis = {"kind": "book"}
-
-    d1, d2, _excl = rec
-    s["last_recommendation"] = rec
-    s["last_entry_basis"] = entry_basis
-    mode_raw = context.bot_data.get("MODE","conservador")
-    mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
-
-    if enter:
-        await ia_send(update, context, format_reco_text(d1, d2, mode), parse_mode="Markdown", reply_markup=entry_keyboard())
-        s["pending_bet"] = {"d1": d1, "d2": d2}
-        s["gale_active"] = True; s["gale_level"] = 0
-    else:
-        await ia_send(update, context, format_wait_text(mode), parse_mode="Markdown")
-
-async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_chat_state(update, context)
-    s = context.chat_data["state"]
-    query = update.callback_query; data = query.data
-
-    if data == "fix_last":
-        if len(s["history"]) == 0 or s["last_input"] is None:
-            await query.answer("Nada para corrigir."); await query.edit_message_reply_markup()
-            await query.message.reply_text("Nada para corrigir."); return
-        s["awaiting_correction"] = True
-        await query.answer(); await query.edit_message_reply_markup()
-        await query.message.reply_text(f"✏️ Envie o número correto para substituir o último: {s['last_input']}")
-
-    elif data == "reset_hist":
-        win = context.bot_data.get("WINDOW", s.get("window_max", 150))
-        context.chat_data["state"] = make_default_state(window_max=win)
-        await query.answer("Histórico resetado."); await query.edit_message_reply_markup()
-        await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.")
-
-    elif data == "set_agressivo":
-        context.bot_data["MODE"] = "agressivo"
-        context.bot_data["MIN_SPINS"] = 8; context.bot_data["P_THRESHOLD"] = 0.15
-        context.bot_data["WINDOW"] = 120; context.bot_data["K"] = 10; context.bot_data["NEED"] = 6
-        await query.answer("Modo agressivo ativado."); await query.edit_message_reply_markup()
-        await query.message.reply_text("✅ Modo agressivo ativado."); await query.message.reply_text(prompt_next_number_text())
-
-    elif data == "set_conservador":
-        context.bot_data["MODE"] = "conservador"
-        context.bot_data["MIN_SPINS"] = 25; context.bot_data["P_THRESHOLD"] = 0.05
-        context.bot_data["WINDOW"] = 200; context.bot_data["K"] = 14; context.bot_data["NEED"] = 9
-        await query.answer("Modo conservador ativado."); await query.edit_message_reply_markup()
-        await query.message.reply_text("✅ Modo conservador ativado."); await query.message.reply_text(prompt_next_number_text())
-    else:
-        await query.answer()
-
-async def ensure_chat_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "state" not in context.chat_data:
-        win = context.bot_data.get("WINDOW", 150)
-        context.chat_data["state"] = make_default_state(window_max=win)
-    else:
-        s = context.chat_data["state"]
-        win = context.bot_data.get("WINDOW", s.get("window_max", 150))
-        if s.get("window_max") != win:
-            old_hist = list(s["history"])
-            s["history"] = deque(old_hist, maxlen=win)
-            s["window_max"] = win
-            recompute_counts_from_history(s)
-
-# ==========================================
-# BOOTSTRAP DO PTB
-# ==========================================
-def build_application() -> Application:
-    appx = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
-    # Defaults: conservador
-    appx.bot_data["MODE"] = "conservador"
-    appx.bot_data["MIN_SPINS"] = 25; appx.bot_data["P_THRESHOLD"] = 0.05
-    appx.bot_data["WINDOW"] = 200; appx.bot_data["K"] = 14; appx.bot_data["NEED"] = 9
-
-    appx.add_handler(CommandHandler("start", start_cmd))
-    appx.add_handler(CommandHandler("help", help_cmd))
-    appx.add_handler(CommandHandler("modo", modo_cmd))
-    appx.add_handler(CommandHandler("status", status_cmd))
-    appx.add_handler(CallbackQueryHandler(cb_handler))
-    appx.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), number_message))
-    return appx
-
-# ==========================================
-# FASTAPI (WEBHOOK) – apenas se USE_WEBHOOK=True
-# ==========================================
-if USE_WEBHOOK:
-    @app.on_event("startup")
-    async def _startup():
-        global ptb_app
-        ptb_app = build_application()
-        await ptb_app.initialize()
-        webhook_url = f"{PUBLIC_URL}/telegram/webhook"
-        await ptb_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET, allowed_updates=Update.ALL_TYPES)
-        await ptb_app.start()
-        log.info("PTB inicializado e webhook configurado em %s", webhook_url)
-
-    @app.on_event("shutdown")
-    async def _shutdown():
-        global ptb_app
-        if ptb_app:
-            try:
-                await ptb_app.bot.delete_webhook(drop_pending_updates=False)
-            except Exception:
-                pass
-            await ptb_app.stop()
-            await ptb_app.shutdown()
-            log.info("PTB finalizado.")
-
-    @app.get("/")
-    async def root():
-        return {"ok": True, "service": "roulette-bot", "version": "2.0.0", "mode": RUN_MODE}
-
-    @app.get("/health")
-    async def health():
-        return {"ok": True}
-
-    @app.post("/telegram/webhook")
-    async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str = Header(None)):
-        if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403, detail="invalid secret")
-        data = await request.json()
-        try:
-            update = Update.de_json(data, ptb_app.bot)
-            await ptb_app.process_update(update)
-        except Exception as e:
-            log.exception("Erro processando update: %s", e)
-        return JSONResponse({"ok": True})
-
-# ==========================================
-# ENTRYPOINT
-# ==========================================
 if __name__ == "__main__":
-    if RUN_MODE == "polling":
-        # BACKGROUND WORKER (recomendado no Render)
-        application = build_application()
-        async def _run():
-            await application.initialize()
-            try:
-                await application.bot.delete_webhook(drop_pending_updates=False)
-            except Exception:
-                pass
-            log.info("Iniciando long polling…")
-            application.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
-
-        asyncio.run(_run())
-
-    else:
-        # WEB SERVICE (Uvicorn deve iniciar este módulo com main:app)
-        import uvicorn
-        log.info("Iniciando Uvicorn em 0.0.0.0:%s (modo webhook)", PORT)
-        uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=1, lifespan="on")
+    port = int(os.environ.get("PORT", 10000))
+    web.run_app(aio, host="0.0.0.0", port=port)
