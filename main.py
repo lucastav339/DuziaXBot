@@ -6,8 +6,14 @@ import random
 from typing import Any, Dict, Tuple, List, Optional
 from collections import deque
 
-from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import JSONResponse
+# ----- Modo de execução -----
+RUN_MODE = os.getenv("RUN_MODE", "polling").lower()  # 'polling' (worker) ou 'webhook' (web)
+USE_WEBHOOK = RUN_MODE == "webhook"
+
+# ===== FastAPI só é importado/criado se for webhook =====
+if USE_WEBHOOK:
+    from fastapi import FastAPI, Request, Header, HTTPException
+    from fastapi.responses import JSONResponse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
@@ -31,23 +37,27 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 PORT = int(os.getenv("PORT", "10000"))
 
-if not BOT_TOKEN or not PUBLIC_URL or not WEBHOOK_SECRET:
-    log.warning("Ambiente incompleto: BOT_TOKEN, PUBLIC_URL e WEBHOOK_SECRET são obrigatórios.")
+if not BOT_TOKEN:
+    log.error("BOT_TOKEN é obrigatório.")
+
+if USE_WEBHOOK and (not PUBLIC_URL or not WEBHOOK_SECRET):
+    log.warning("WEBHOOK: PUBLIC_URL e WEBHOOK_SECRET são obrigatórios para modo webhook.")
 
 # =========================
-# FastAPI app
+# App containers (definidos conforme o modo)
 # =========================
-app = FastAPI(title="Roulette Signals Bot", version="1.9.2-ia")
-ptb_app: Optional[Application] = None
+ptb_app: Optional[Application] = None  # será criado por build_application()
+
+if USE_WEBHOOK:
+    app = FastAPI(title="Roulette Signals Bot", version="2.0.0")
 
 # =========================
-# Simulação de IA (somente efeito 'digitando…', sem moldura)
+# Simulação de IA (typing)
 # =========================
-IA_MODE = True          # liga/desliga a simulação de IA
-IA_ADD_HEADER = False   # mantido por compatibilidade; permanece False (sem moldura)
+IA_MODE = True
+IA_ADD_HEADER = False
 
 async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_delay=0.35, max_delay=0.8):
-    """Simula IA 'pensando' antes de responder (modo discreto, sem alterar visual)."""
     if not IA_MODE:
         return
     try:
@@ -57,16 +67,14 @@ async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_dela
         pass
 
 def ia_wrap(text: str) -> str:
-    """Sem moldura: retorna o texto intacto."""
     return text
 
 async def ia_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
-    """Substituto de reply_text com 'digitando…' (sem moldura)."""
     await ia_typing(update, context)
     return await update.message.reply_text(ia_wrap(text), **kwargs)
 
 # =========================
-# “Justificativas” aleatórias (entrada/erro) sem repetição consecutiva
+# “Justificativas” aleatórias
 # =========================
 JUSTIFICATIVAS_ENTRADA = [
     "Padrão de repetição detectado nas últimas ocorrências, favorecendo essa combinação.",
@@ -80,7 +88,6 @@ JUSTIFICATIVAS_ENTRADA = [
     "A leitura de tendência estável aumenta a confiança nesta recomendação.",
     "O desvio padrão recente indica consistência na repetição dessa configuração."
 ]
-
 JUSTIFICATIVAS_ERRO = [
     "A variação inesperada na distribuição quebrou o padrão observado nas últimas rodadas.",
     "O desvio foi atípico e rompeu a correlação estatística das dúzias.",
@@ -120,7 +127,7 @@ def dozen_of(n: int) -> Optional[str]:
         return "D2"
     if 25 <= n <= 36:
         return "D3"
-    return None  # zero ou inválido
+    return None
 
 def make_default_state(window_max: int = 150) -> Dict[str, Any]:
     return {
@@ -132,24 +139,15 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
         "last_recommendation": ("D1","D2","D3"),
         "last_reason": "",
         "window_max": window_max,
-        # Estatísticas
         "bets": 0,
         "wins": 0,
         "losses": 0,
         "win_streak": 0,
-        "pending_bet": None,         # {"d1": "D1", "d2": "D2"} aguardando próximo giro
-        # Correção
+        "pending_bet": None,
         "awaiting_correction": False,
-        "last_input": None,          # último número recebido
-        "last_closure": {            # snapshot do fechamento que ocorreu no último giro
-            "had": False,
-            "was_win": False,
-            "prev_pending": None,
-            "prev_streak": 0,
-        },
-        # Base da última ENTRADA (para justificar GALE no erro)
-        "last_entry_basis": {"kind": None},  # "book" | "quick" | None
-        # Anti-repetição de justificativas
+        "last_input": None,
+        "last_closure": {"had": False, "was_win": False, "prev_pending": None, "prev_streak": 0},
+        "last_entry_basis": {"kind": None},
         "last_just_entry_idx": -1,
         "last_just_error_idx": -1,
     }
@@ -213,11 +211,7 @@ def last_k_dozens(state: Dict[str, Any], k: int) -> List[str]:
     seq = list(state["history"])[-k:]
     return [dozen_of(x) for x in seq if 0 <= x <= 36 and dozen_of(x) is not None]
 
-def quick_edge_two_dozens(
-    state: Dict[str, Any],
-    k: int = 12,
-    need: int = 7
-) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
+def quick_edge_two_dozens(state: Dict[str, Any], k: int = 12, need: int = 7) -> Tuple[bool, Tuple[str,str,str], str, Dict[str,int]]:
     dzs = last_k_dozens(state, k)
     if len(dzs) < k:
         return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente", {"D1":0,"D2":0,"D3":0})
@@ -231,11 +225,7 @@ def quick_edge_two_dozens(
         return (True, (d1,d2,excl), f"curto-prazo: {c[d1]}+{c[d2]} em {k}", c)
     return (False, ("D1","D2","D3"), f"curto-prazo insuficiente: {c[d1]}+{c[d2]}<{need}", c)
 
-def should_enter_book_style(
-    state: Dict[str, Any],
-    min_spins: int,
-    p_threshold: float
-) -> Tuple[bool, str, Tuple[str,str,str]]:
+def should_enter_book_style(state: Dict[str, Any], min_spins: int, p_threshold: float) -> Tuple[bool, str, Tuple[str,str,str]]:
     total = state.get("total_spins", 0)
     if total < min_spins:
         return (False, f"amostra insuficiente ({total}/{min_spins})", ("D1","D2","D3"))
@@ -335,7 +325,6 @@ def prompt_next_number_text() -> str:
 # =========================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mensagem de boas-vindas com identidade iDozen (IA) e mesmo design."""
     await ensure_chat_state(update, context)
     mode_raw = context.bot_data.get("MODE", "conservador")
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
@@ -416,7 +405,7 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ia_send(update, context, "Envie números entre 0 e 36.")
         return
 
-    # Correção: se aguardando número de correção, substitui o último
+    # Correção
     if s.get("awaiting_correction", False):
         if len(s["history"]) == 0 or s["last_input"] is None:
             s["awaiting_correction"] = False
@@ -458,19 +447,14 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ia_send(update, context, f"✔️ Corrigido: {old} → {n}\n" + stats_text(s))
         return
 
-    # --- FECHAMENTO DE APOSTA PENDENTE (resultado do giro anterior) ---
+    # Fechamento de aposta pendente
     prev_pending = s["pending_bet"]
     if s.get("pending_bet"):
         d1p = s["pending_bet"]["d1"]; d2p = s["pending_bet"]["d2"]
         dz = dozen_of(n)
         s["bets"] += 1
         was_win = (dz in (d1p, d2p))
-        s["last_closure"] = {
-            "had": True,
-            "was_win": was_win,
-            "prev_pending": prev_pending,
-            "prev_streak": s.get("win_streak", 0),
-        }
+        s["last_closure"] = {"had": True, "was_win": was_win, "prev_pending": prev_pending, "prev_streak": s.get("win_streak", 0)}
         if was_win:
             s["wins"] += 1
             s["win_streak"] = s.get("win_streak", 0) + 1
@@ -485,34 +469,31 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s["gale_active"] = True
             s["gale_level"] = 1
             await ia_send(update, context, result_text + "\n" + stats_text(s))
-            # Desculpa técnica aleatória (sem repetir)
             txt, idx = pick_no_repeat(JUSTIFICATIVAS_ERRO, s.get("last_just_error_idx", -1))
             s["last_just_error_idx"] = idx
             await ia_send(update, context, f"📖 {txt}")
-            # Orientação GALE com justificativa
             await ia_send(update, context, gale_justification_text(s, d1p, d2p))
 
         s["pending_bet"] = None
     else:
         s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None, "prev_streak": s.get("win_streak", 0)}
 
-    # 1) Empilha no histórico (janela deslizante)
+    # Histórico e contagens
     s["history"].append(n)
-    # 2) Recalcula contagens
     update_counts(s, n)
     s["last_input"] = n
 
-    # 3) Parâmetros de decisão
+    # Parâmetros
     MIN_SPINS = context.bot_data.get("MIN_SPINS", 15)
     P_THRESHOLD = context.bot_data.get("P_THRESHOLD", 0.10)
     K = context.bot_data.get("K", 12)
     NEED = context.bot_data.get("NEED", 7)
 
-    # 4) Gate “estilo livros”
+    # Gate estilo livros
     enter, _reason, rec = should_enter_book_style(s, MIN_SPINS, P_THRESHOLD)
     entry_basis = {"kind": None}
 
-    # 5) Fallback curto-prazo
+    # Fallback curto-prazo
     if not enter:
         q_ok, q_rec, _q_reason, counts = quick_edge_two_dozens(s, k=K, need=NEED)
         if q_ok:
@@ -544,7 +525,6 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ia_send(update, context, format_wait_text(mode), parse_mode="Markdown")
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback dos botões inline (modos + corrigir/reset)."""
     await ensure_chat_state(update, context)
     s = context.chat_data["state"]
     query = update.callback_query
@@ -616,96 +596,122 @@ async def ensure_chat_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
             recompute_counts_from_history(s)
 
 # =========================
-# PTB + Webhook bootstrap (ordem correta: initialize → set_webhook → start)
+# Bootstrap PTB (comum aos dois modos)
 # =========================
-async def on_startup() -> None:
-    global ptb_app
-    if ptb_app is None:
-        ptb_app = (
-            ApplicationBuilder()
-            .token(BOT_TOKEN)
-            .concurrent_updates(True)
-            .build()
-        )
+def build_application() -> Application:
+    appx = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
+    # Defaults: CONSERVADOR
+    appx.bot_data["MODE"] = "conservador"
+    appx.bot_data["MIN_SPINS"] = 25
+    appx.bot_data["P_THRESHOLD"] = 0.05
+    appx.bot_data["WINDOW"] = 200
+    appx.bot_data["K"] = 14
+    appx.bot_data["NEED"] = 9
 
-        # Defaults: modo CONSERVADOR
-        ptb_app.bot_data["MODE"] = "conservador"
-        ptb_app.bot_data["MIN_SPINS"] = 25
-        ptb_app.bot_data["P_THRESHOLD"] = 0.05
-        ptb_app.bot_data["WINDOW"] = 200
-        ptb_app.bot_data["K"] = 14
-        ptb_app.bot_data["NEED"] = 9
+    # Handlers
+    appx.add_handler(CommandHandler("start", start_cmd))
+    appx.add_handler(CommandHandler("help", help_cmd))
+    appx.add_handler(CommandHandler("modo", modo_cmd))
+    appx.add_handler(CommandHandler("status", status_cmd))
+    appx.add_handler(CallbackQueryHandler(cb_handler))
+    appx.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), number_message))
+    return appx
 
-        # Handlers
-        ptb_app.add_handler(CommandHandler("start", start_cmd))
-        ptb_app.add_handler(CommandHandler("help", help_cmd))
-        ptb_app.add_handler(CommandHandler("modo", modo_cmd))
-        ptb_app.add_handler(CommandHandler("status", status_cmd))
-        ptb_app.add_handler(CallbackQueryHandler(cb_handler))
-        ptb_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), number_message))
+# =========================
+# Modo WEBHOOK (FastAPI)
+# =========================
+if USE_WEBHOOK:
+    async def on_startup() -> None:
+        global ptb_app
+        if ptb_app is None:
+            ptb_app = build_application()
+            await ptb_app.initialize()
+            webhook_url = f"{PUBLIC_URL}/telegram/webhook"
+            # seta webhook
+            await ptb_app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=Update.ALL_TYPES
+            )
+            await ptb_app.start()
+            log.info("PTB inicializado e webhook configurado em %s", webhook_url)
 
-        # ORDEM correta
-        await ptb_app.initialize()
-        webhook_url = f"{PUBLIC_URL}/telegram/webhook"
-        await ptb_app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=Update.ALL_TYPES
-        )
-        await ptb_app.start()
-        log.info("PTB inicializado e webhook configurado em %s", webhook_url)
-
-def _log_routes():
-    try:
-        routes = [getattr(r, "path", str(r)) for r in app.routes]
-        log.info("Rotas registradas: %s", routes)
-    except Exception as e:
-        log.warning("Não consegui listar rotas: %s", e)
-
-@app.on_event("startup")
-async def _startup():
-    await on_startup()
-    _log_routes()
-
-@app.on_event("shutdown")
-async def _shutdown():
-    global ptb_app
-    if ptb_app:
+    @app.on_event("startup")
+    async def _startup():
+        await on_startup()
         try:
-            await ptb_app.bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-        await ptb_app.stop()
-        await ptb_app.shutdown()
-        log.info("PTB finalizado.")
+            routes = [getattr(r, "path", str(r)) for r in app.routes]
+            log.info("Rotas registradas: %s", routes)
+        except Exception as e:
+            log.warning("Não consegui listar rotas: %s", e)
+
+    @app.on_event("shutdown")
+    async def _shutdown():
+        global ptb_app
+        if ptb_app:
+            try:
+                # Mantemos drop_pending_updates=False para não perder msgs
+                await ptb_app.bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            await ptb_app.stop()
+            await ptb_app.shutdown()
+            log.info("PTB finalizado.")
+
+    @app.get("/")
+    async def root():
+        return {"ok": True, "service": "roulette-bot", "version": "2.0.0", "mode": RUN_MODE}
+
+    @app.get("/health")
+    async def health():
+        return {"ok": True}
+
+    @app.post("/telegram/webhook")
+    async def telegram_webhook(
+        request: "Request",
+        x_telegram_bot_api_secret_token: str = Header(None)
+    ):
+        if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="invalid secret")
+        data = await request.json()
+        try:
+            update = Update.de_json(data, ptb_app.bot)
+            await ptb_app.process_update(update)
+        except Exception as e:
+            log.exception("Erro processando update: %s", e)
+        return JSONResponse({"ok": True})
 
 # =========================
-# Rotas HTTP (root/health/webhook)
+# ENTRYPOINT
 # =========================
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "roulette-bot", "version": "1.9.2-ia"}
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str = Header(None)
-):
-    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="invalid secret")
-    data = await request.json()
-    try:
-        update = Update.de_json(data, ptb_app.bot)
-        await ptb_app.process_update(update)
-    except Exception as e:
-        log.exception("Erro processando update: %s", e)
-    return JSONResponse({"ok": True})
-
 if __name__ == "__main__":
-    import uvicorn
-    log.info("Iniciando Uvicorn em 0.0.0.0:%s", PORT)
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    if RUN_MODE == "polling":
+        # === Modo Worker: long polling ===
+        application = build_application()
+        # Garantir que não há webhook ativo
+        async def _run():
+            await application.initialize()
+            try:
+                await application.bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            # Usa a API síncrona de conveniência (segura) para polling
+            application.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
+
+        # Roda
+        asyncio.run(_run())
+
+    else:
+        # === Modo Webhook: Web Service com Uvicorn ===
+        if not USE_WEBHOOK:
+            log.error("RUN_MODE diferente de 'polling', mas USE_WEBHOOK não está True.")
+        else:
+            import uvicorn
+            log.info("Iniciando Uvicorn em 0.0.0.0:%s (modo webhook)", PORT)
+            # 1 worker, sem reload, lifespan on (configure também no Render)
+            uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=1, lifespan="on")
