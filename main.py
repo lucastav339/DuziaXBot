@@ -343,11 +343,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = (
      "🤖 **iDozen — Mestre das Dúzias**\n\n"
     f"🎛️ **Modo Ativado:** _{mode}_\n\n"
-    "📋 **Como começar:**\n\n"
-    "1️⃣ **Selecione o modo de operação**  \n"
-    "  🎯 **Agressivo** ou 🛡️ **Conservador**  \n"
-    "2️⃣ **Envie o número** que saiu na roleta   \n"
-    "3️⃣ **Aguarde a análise** e receba a **recomendação** quando houver oportunidade\n\n"
+    "📋 *Como começar:*\n\n"
+    "1️⃣ **Selecione o modo de operação.**  \n\n"
+    "  🎯 *Agressivo*    🛡️ *Conservador*  \n\n"
+    "2️⃣ *Envie o *número* que saiu na roleta.   \n"
+    "3️⃣ **Aguarde a análise.**\n\n"
      
     )
 
