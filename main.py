@@ -1,4 +1,3 @@
-# main.py
 import os
 import asyncio
 import logging
@@ -6,30 +5,32 @@ import random
 from typing import Any, Dict, Tuple, List, Optional
 from collections import deque
 
-# ----- Modo de execução -----
+# ==========================================
+# MODO DE EXECUÇÃO
+# ==========================================
 RUN_MODE = os.getenv("RUN_MODE", "polling").lower()  # 'polling' (worker) ou 'webhook' (web)
 USE_WEBHOOK = RUN_MODE == "webhook"
 
-# ===== FastAPI só é importado/criado se for webhook =====
+# Mesmo em polling, expomos um FastAPI "stub" para não quebrar se alguém subir uvicorn por engano.
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse
+
 if USE_WEBHOOK:
-    from fastapi import FastAPI, Request, Header, HTTPException
-    from fastapi.responses import JSONResponse
+    app = FastAPI(title="Roulette Bot", version="2.0.0", description="Modo webhook (FastAPI + Telegram Webhook)")
+else:
+    app = FastAPI(title="Roulette Bot (stub)", version="2.0.0", description="Rodando em polling; este app é só um stub.")
+    @app.get("/")
+    async def root_stub():
+        return {"ok": True, "mode": "polling", "note": "O bot real está rodando via long polling (Background Worker)."}
+    @app.get("/health")
+    async def health_stub():
+        return {"ok": True}
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application, ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, CallbackQueryHandler, filters
-)
-
-# =========================
-# Config & Logging
-# =========================
+# ==========================================
+# LOG / CONFIG
+# ==========================================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("roulette-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -40,24 +41,24 @@ PORT = int(os.getenv("PORT", "10000"))
 if not BOT_TOKEN:
     log.error("BOT_TOKEN é obrigatório.")
 
-if USE_WEBHOOK and (not PUBLIC_URL or not WEBHOOK_SECRET):
-    log.warning("WEBHOOK: PUBLIC_URL e WEBHOOK_SECRET são obrigatórios para modo webhook.")
+# ==========================================
+# TELEGRAM (python-telegram-bot v20+)
+# ==========================================
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application, ApplicationBuilder, ContextTypes,
+    CommandHandler, MessageHandler, CallbackQueryHandler, filters
+)
 
-# =========================
-# App containers (definidos conforme o modo)
-# =========================
-ptb_app: Optional[Application] = None  # será criado por build_application()
+ptb_app: Optional[Application] = None  # global em webhook
 
-if USE_WEBHOOK:
-    app = FastAPI(title="Roulette Signals Bot", version="2.0.0")
-
-# =========================
-# Simulação de IA (typing)
-# =========================
+# ==========================================
+# IA / TIPAGEM
+# ==========================================
 IA_MODE = True
-IA_ADD_HEADER = False
 
-async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_delay=0.35, max_delay=0.8):
+async def ia_typing(update: Update, context: ContextTypes.DEFAULT_TYPE, min_delay=0.25, max_delay=0.65):
     if not IA_MODE:
         return
     try:
@@ -73,9 +74,9 @@ async def ia_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
     await ia_typing(update, context)
     return await update.message.reply_text(ia_wrap(text), **kwargs)
 
-# =========================
-# “Justificativas” aleatórias
-# =========================
+# ==========================================
+# LÓGICA DO BOT (duzias) — igual/estável
+# ==========================================
 JUSTIFICATIVAS_ENTRADA = [
     "Padrão de repetição detectado nas últimas ocorrências, favorecendo essa combinação.",
     "Tendência estatística reforçada pela dominância recente das dúzias selecionadas.",
@@ -101,32 +102,12 @@ JUSTIFICATIVAS_ERRO = [
     "O cálculo foi consistente, mas o resultado destoou do esperado."
 ]
 
-def pick_no_repeat(pool: List[str], last_idx: int) -> Tuple[str, int]:
-    if not pool:
-        return "", -1
-    if len(pool) == 1:
-        return pool[0], 0
-    idx = last_idx
-    while idx == last_idx:
-        idx = random.randrange(len(pool))
-    return pool[idx], idx
-
-# =========================
-# Regras/Utilidades
-# =========================
-DOZENS = {
-    "D1": set(range(1, 13)),
-    "D2": set(range(13, 25)),
-    "D3": set(range(25, 37)),
-}
+DOZENS = {"D1": set(range(1, 13)), "D2": set(range(13, 25)), "D3": set(range(25, 37))}
 
 def dozen_of(n: int) -> Optional[str]:
-    if 1 <= n <= 12:
-        return "D1"
-    if 13 <= n <= 24:
-        return "D2"
-    if 25 <= n <= 36:
-        return "D3"
+    if 1 <= n <= 12: return "D1"
+    if 13 <= n <= 24: return "D2"
+    if 25 <= n <= 36: return "D3"
     return None
 
 def make_default_state(window_max: int = 150) -> Dict[str, Any]:
@@ -139,10 +120,7 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
         "last_recommendation": ("D1","D2","D3"),
         "last_reason": "",
         "window_max": window_max,
-        "bets": 0,
-        "wins": 0,
-        "losses": 0,
-        "win_streak": 0,
+        "bets": 0, "wins": 0, "losses": 0, "win_streak": 0,
         "pending_bet": None,
         "awaiting_correction": False,
         "last_input": None,
@@ -153,29 +131,24 @@ def make_default_state(window_max: int = 150) -> Dict[str, Any]:
     }
 
 def recompute_counts_from_history(state: Dict[str, Any]) -> None:
-    counts = [0]*37
-    total = 0
+    counts = [0]*37; total = 0
     for x in state["history"]:
         if 0 <= x <= 36:
-            counts[x] += 1
-            total += 1
-    state["counts"] = counts
-    state["total_spins"] = total
+            counts[x] += 1; total += 1
+    state["counts"] = counts; state["total_spins"] = total
 
 def update_counts(state: Dict[str, Any], _new_number: int) -> None:
     recompute_counts_from_history(state)
 
 def chi_square_bias(counts: List[int], total: int) -> Tuple[float, float]:
-    if total <= 0:
-        return 0.0, 1.0
+    if total <= 0: return 0.0, 1.0
     exp = total / 37.0
     chi2 = 0.0
     for c in counts:
         chi2 += (c - exp) ** 2 / exp
     import math
     df = 36.0
-    if chi2 <= 0:
-        return 0.0, 1.0
+    if chi2 <= 0: return 0.0, 1.0
     z = ((chi2/df)**(1.0/3.0) - (1 - 2/(9*df))) / math.sqrt(2/(9*df))
     p = 1 - 0.5*(1 + math.erf(z / math.sqrt(2)))
     p = max(0.0, min(1.0, p))
@@ -183,25 +156,19 @@ def chi_square_bias(counts: List[int], total: int) -> Tuple[float, float]:
 
 def find_hottest_sector(counts: List[int], window_len: int = 12) -> List[int]:
     n = 37
-    if window_len >= n:
-        return list(range(n))
+    if window_len >= n: return list(range(n))
     extended = counts + counts[:window_len-1]
-    max_sum = sum(extended[:window_len])
-    best_start = 0
-    cur_sum = max_sum
+    max_sum = sum(extended[:window_len]); best_start = 0; cur_sum = max_sum
     for i in range(1, n):
         cur_sum += extended[i+window_len-1] - extended[i-1]
-        if cur_sum > max_sum:
-            max_sum = cur_sum
-            best_start = i
+        if cur_sum > max_sum: max_sum = cur_sum; best_start = i
     return [(best_start + j) % n for j in range(window_len)]
 
 def sector_to_two_dozens(sector: List[int]) -> Tuple[str, str, str]:
     hits = {"D1":0,"D2":0,"D3":0}
     for p in sector:
         d = dozen_of(p)
-        if d:
-            hits[d] += 1
+        if d: hits[d] += 1
     ordered = sorted(hits.items(), key=lambda kv:(-kv[1], kv[0]))
     d1, d2 = ordered[0][0], ordered[1][0]
     excl = ({'D1','D2','D3'} - {d1,d2}).pop()
@@ -216,8 +183,7 @@ def quick_edge_two_dozens(state: Dict[str, Any], k: int = 12, need: int = 7) -> 
     if len(dzs) < k:
         return (False, ("D1","D2","D3"), "curto-prazo: janela insuficiente", {"D1":0,"D2":0,"D3":0})
     c = {"D1":0, "D2":0, "D3":0}
-    for d in dzs:
-        c[d] += 1
+    for d in dzs: c[d] += 1
     ordered = sorted(c.items(), key=lambda kv:(-kv[1], kv[0]))
     d1, d2 = ordered[0][0], ordered[1][0]
     excl = ({'D1','D2','D3'} - {d1,d2}).pop()
@@ -237,113 +203,78 @@ def should_enter_book_style(state: Dict[str, Any], min_spins: int, p_threshold: 
     return (True, "viés detectado", (d1,d2,excl))
 
 def stats_text(state: Dict[str, Any]) -> str:
-    b = state.get("bets", 0)
-    w = state.get("wins", 0)
-    l = state.get("losses", 0)
-    rate = (w / b * 100) if b else 0.0
-    streak = state.get("win_streak", 0)
-    return (
-        f"📊 Estatísticas\n"
-        f"✅ Acertos: {w}\n"
-        f"❌ Erros: {l}\n"
-        f"📈 Taxa: {rate:.1f}%  (em {b} apostas)\n"
-        f"🔥 Sequência de vitórias: {streak}"
-    )
+    b = state.get("bets", 0); w = state.get("wins", 0); l = state.get("losses", 0)
+    rate = (w / b * 100) if b else 0.0; streak = state.get("win_streak", 0)
+    return (f"📊 Estatísticas\n"
+            f"✅ Acertos: {w}\n"
+            f"❌ Erros: {l}\n"
+            f"📈 Taxa: {rate:.1f}%  (em {b} apostas)\n"
+            f"🔥 Sequência de vitórias: {streak}")
 
-# ---- Mensagens / Teclados ----
 def format_reco_text(d1: str, d2: str, mode: str) -> str:
-    return (
-        f"🎬 **ENTRAR**\n"
-        f"🎯 Recomendação: **{d1} + {d2}**\n"
-        f"🧩 Modo Ativado: {mode}\n"
-        f"ℹ️ Envie o próximo número."
-    )
+    return (f"🎬 **ENTRAR**\n"
+            f"🎯 Recomendação: **{d1} + {d2}**\n"
+            f"🧩 Modo Ativado: {mode}\n"
+            f"ℹ️ Envie o próximo número.")
 
 def format_wait_text(mode: str) -> str:
-    return (
-        f"⏳ **Aguardar**\n"
-        f"🧩 Modo Ativado: {mode}\n"
-        f"ℹ️ Envie o próximo número."
-    )
+    return (f"⏳ **Aguardar**\n"
+            f"🧩 Modo Ativado: {mode}\n"
+            f"ℹ️ Envie o próximo número.")
 
 def gale_justification_text(state: Dict[str, Any], d1: str, d2: str) -> str:
     basis = state.get("last_entry_basis", {"kind": None})
     kind = basis.get("kind")
     if kind == "quick":
-        k = basis.get("k", 12)
-        need = basis.get("need", 7)
+        k = basis.get("k", 12); need = basis.get("need", 7)
         counts = state.get("last_entry_basis", {}).get("counts", {"D1":0, "D2":0, "D3":0})
         c1 = counts.get(d1, 0); c2 = counts.get(d2, 0)
-        return (
-            f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
-            f"🧾 Justificativa: no curto prazo, essas duas dúzias somam {c1+c2} ocorrências nos últimos {k} giros "
-            f"(limiar {need}). O erro pode ser variância; repetir **uma vez** é coerente."
-        )
+        return (f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
+                f"🧾 Justificativa: no curto prazo, somam {c1+c2} ocorrências nos últimos {k} giros "
+                f"(limiar {need}). Repetir **uma vez** é coerente.")
     elif kind == "book":
-        return (
-            f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
-            f"🧾 Justificativa: o padrão de setor ainda é dominante na janela recente; "
-            f"um erro isolado não invalida o viés. Repetir **uma vez** mantém a coerência do modelo."
-        )
+        return (f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
+                f"🧾 Justificativa: o setor dominante ainda prevalece — erro isolado = variância.")
     else:
-        return (
-            f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
-            f"🧾 Justificativa: vantagem local recente; repetir **uma vez** reduz impacto da variância."
-        )
+        return (f"🛠️ **GALE Nível 1 sugerido** nas mesmas dúzias **{d1} + {d2}**.\n"
+                f"🧾 Justificativa: vantagem local recente; repetir **uma vez** reduz variância.")
 
 def entry_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✏️ Corrigir último", callback_data="fix_last"),
-                InlineKeyboardButton("🗑️ Reset histórico", callback_data="reset_hist"),
-            ],
-            [
-                InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
-                InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador"),
-            ]
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Corrigir último", callback_data="fix_last"),
+         InlineKeyboardButton("🗑️ Reset histórico", callback_data="reset_hist")],
+        [InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
+         InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador")]
+    ])
 
 def mode_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
-            InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador"),
-        ]]
-    )
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎯 Modo agressivo", callback_data="set_agressivo"),
+        InlineKeyboardButton("🛡️ Modo conservador", callback_data="set_conservador"),
+    ]])
 
 def prompt_next_number_text() -> str:
-    return (
-        "👉 Agora me diga o **número que acabou de sair** na roleta (0–36).\n"
-        "Ex.: 17\n"
-        "Dica: se enviar errado, quando aparecer uma **ENTRADA** você poderá tocar em **✏️ Corrigir último**."
-    )
+    return ("👉 Envie o **número que saiu** na roleta (0–36). Ex.: 17\n"
+            "Dica: se enviar errado, toque em **✏️ Corrigir último** após a próxima entrada.")
 
-# =========================
-# Handlers
-# =========================
-
+# ==========================================
+# HANDLERS
+# ==========================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
     mode_raw = context.bot_data.get("MODE", "conservador")
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
-
-    texto = (
-    "🤖 *iDozen — Mestre das Dúzias*\n\n"
-    "📋 *Como começar:*\n\n"
-    "1️⃣ **Selecione o modo de operação:**\n\n"
-    "  🎯 *Agressivo*   |   🛡️ *Conservador*\n\n"
-    "2️⃣ **Envie o número.**\n\n"
-    "3️⃣ **Aguarde a análise.**\n\n"
-    f"🎛️ **Modo Ativado:** _{mode}_\n\n"
-    )
-
+    texto = ("🤖 *iDozen — Mestre das Dúzias*\n\n"
+             "📋 *Como começar:*\n\n"
+             "1️⃣ **Selecione o modo de operação:**\n\n"
+             "  🎯 *Agressivo*   |   🛡️ *Conservador*\n\n"
+             "2️⃣ **Envie o número.**\n\n"
+             "3️⃣ **Aguarde a análise.**\n\n"
+             f"🎛️ **Modo Ativado:** _{mode}_\n\n")
     await ia_send(update, context, texto, reply_markup=mode_keyboard(), parse_mode="Markdown")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ia_send(
-        update, context,
+    await ia_send(update, context,
         "Comandos:\n"
         "/start – iniciar\n"
         "/modo agressivo|conservador – perfil de entradas\n"
@@ -357,23 +288,16 @@ async def modo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur_pt = "Agressivo" if cur.lower().startswith("agress") else "Conservador"
         await ia_send(update, context, f"🧩 Modo Ativado: {cur_pt}\nUse: /modo agressivo  ou  /modo conservador")
         return
-
     arg = context.args[0].lower().strip()
     if arg in ("agressivo", "agro"):
         context.bot_data["MODE"] = "agressivo"
-        context.bot_data["MIN_SPINS"] = 8
-        context.bot_data["P_THRESHOLD"] = 0.15
-        context.bot_data["WINDOW"] = 120
-        context.bot_data["K"] = 10
-        context.bot_data["NEED"] = 6
+        context.bot_data["MIN_SPINS"] = 8; context.bot_data["P_THRESHOLD"] = 0.15
+        context.bot_data["WINDOW"] = 120; context.bot_data["K"] = 10; context.bot_data["NEED"] = 6
         msg = "✅ Modo agressivo ativado."
     elif arg in ("conservador", "safe"):
         context.bot_data["MODE"] = "conservador"
-        context.bot_data["MIN_SPINS"] = 25
-        context.bot_data["P_THRESHOLD"] = 0.05
-        context.bot_data["WINDOW"] = 200
-        context.bot_data["K"] = 14
-        context.bot_data["NEED"] = 9
+        context.bot_data["MIN_SPINS"] = 25; context.bot_data["P_THRESHOLD"] = 0.05
+        context.bot_data["WINDOW"] = 200; context.bot_data["K"] = 14; context.bot_data["NEED"] = 9
         msg = "✅ Modo conservador ativado."
     else:
         msg = "Use: /modo agressivo  ou  /modo conservador"
@@ -386,11 +310,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode_raw = context.bot_data.get("MODE","conservador")
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
     d1, d2, _excl = s.get("last_recommendation", ("D1","D2","D3"))
-    msg = (
-        f"🧩 Modo Ativado: {mode}\n"
-        f"Última recomendação: {d1} + {d2}\n"
-        + stats_text(s)
-    )
+    msg = (f"🧩 Modo Ativado: {mode}\n"
+           f"Última recomendação: {d1} + {d2}\n" + stats_text(s))
     await ia_send(update, context, msg, parse_mode="Markdown")
 
 async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -398,102 +319,42 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = context.chat_data["state"]
 
     text = (update.message.text or "").strip()
-    if not text.isdigit():
-        return
+    if not text.isdigit(): return
     n = int(text)
     if n < 0 or n > 36:
-        await ia_send(update, context, "Envie números entre 0 e 36.")
-        return
+        await ia_send(update, context, "Envie números entre 0 e 36."); return
 
-    # Correção
-    if s.get("awaiting_correction", False):
-        if len(s["history"]) == 0 or s["last_input"] is None:
-            s["awaiting_correction"] = False
-            await ia_send(update, context, "Nada para corrigir no momento.")
-            return
-
-        old = s["last_input"]
-        if len(s["history"]) > 0:
-            s["history"].pop()
-
-        lc = s.get("last_closure", {"had": False})
-        if lc.get("had", False):
-            if s["bets"] > 0:
-                s["bets"] -= 1
-            if lc.get("was_win", False):
-                if s["wins"] > 0:
-                    s["wins"] -= 1
-                s["win_streak"] = lc.get("prev_streak", 0)
-            else:
-                if s["losses"] > 0:
-                    s["losses"] -= 1
-                s["win_streak"] = lc.get("prev_streak", 0)
-
-            prev_pending = lc.get("prev_pending")
-            dz_new = dozen_of(n)
-            s["bets"] += 1
-            if prev_pending and dz_new in (prev_pending["d1"], prev_pending["d2"]):
-                s["wins"] += 1
-                s["win_streak"] = lc.get("prev_streak", 0) + 1
-            else:
-                s["losses"] += 1
-                s["win_streak"] = 0
-
-        s["history"].append(n)
-        recompute_counts_from_history(s)
-        s["last_input"] = n
-        s["awaiting_correction"] = False
-
-        await ia_send(update, context, f"✔️ Corrigido: {old} → {n}\n" + stats_text(s))
-        return
-
-    # Fechamento de aposta pendente
+    # Fechar aposta anterior (se havia)
     prev_pending = s["pending_bet"]
-    if s.get("pending_bet"):
-        d1p = s["pending_bet"]["d1"]; d2p = s["pending_bet"]["d2"]
-        dz = dozen_of(n)
-        s["bets"] += 1
-        was_win = (dz in (d1p, d2p))
+    if prev_pending:
+        dz = dozen_of(n); s["bets"] += 1
+        was_win = (dz in (prev_pending["d1"], prev_pending["d2"]))
         s["last_closure"] = {"had": True, "was_win": was_win, "prev_pending": prev_pending, "prev_streak": s.get("win_streak", 0)}
         if was_win:
-            s["wins"] += 1
-            s["win_streak"] = s.get("win_streak", 0) + 1
-            result_text = f"✅ Acertou ({n}{'' if dz is None else f' em {dz}'})."
-            s["gale_active"] = False
-            s["gale_level"] = 0
-            await ia_send(update, context, result_text + "\n" + stats_text(s))
+            s["wins"] += 1; s["win_streak"] = s.get("win_streak", 0) + 1
+            await ia_send(update, context, f"✅ Acertou ({n}{'' if dz is None else f' em {dz}'}).\n" + stats_text(s))
+            s["gale_active"] = False; s["gale_level"] = 0
         else:
-            s["losses"] += 1
-            s["win_streak"] = 0
-            result_text = f"❌ Errou ({n}{'' if dz is None else f' em {dz}'})."
-            s["gale_active"] = True
-            s["gale_level"] = 1
-            await ia_send(update, context, result_text + "\n" + stats_text(s))
-            txt, idx = pick_no_repeat(JUSTIFICATIVAS_ERRO, s.get("last_just_error_idx", -1))
-            s["last_just_error_idx"] = idx
-            await ia_send(update, context, f"📖 {txt}")
-            await ia_send(update, context, gale_justification_text(s, d1p, d2p))
-
+            s["losses"] += 1; s["win_streak"] = 0
+            await ia_send(update, context, f"❌ Errou ({n}{'' if dz is None else f' em {dz}'}).\n" + stats_text(s))
+            s["gale_active"] = True; s["gale_level"] = 1
+            await ia_send(update, context, random.choice(JUSTIFICATIVAS_ERRO))
+            await ia_send(update, context, gale_justification_text(s, prev_pending["d1"], prev_pending["d2"]))
         s["pending_bet"] = None
     else:
         s["last_closure"] = {"had": False, "was_win": False, "prev_pending": None, "prev_streak": s.get("win_streak", 0)}
 
-    # Histórico e contagens
-    s["history"].append(n)
-    update_counts(s, n)
-    s["last_input"] = n
+    # Atualiza histórico
+    s["history"].append(n); update_counts(s, n); s["last_input"] = n
 
-    # Parâmetros
+    # Parâmetros do modo
     MIN_SPINS = context.bot_data.get("MIN_SPINS", 15)
     P_THRESHOLD = context.bot_data.get("P_THRESHOLD", 0.10)
-    K = context.bot_data.get("K", 12)
-    NEED = context.bot_data.get("NEED", 7)
+    K = context.bot_data.get("K", 12); NEED = context.bot_data.get("NEED", 7)
 
-    # Gate estilo livros
+    # Gate "livros"
     enter, _reason, rec = should_enter_book_style(s, MIN_SPINS, P_THRESHOLD)
     entry_basis = {"kind": None}
-
-    # Fallback curto-prazo
     if not enter:
         q_ok, q_rec, _q_reason, counts = quick_edge_two_dozens(s, k=K, need=NEED)
         if q_ok:
@@ -505,80 +366,48 @@ async def number_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d1, d2, _excl = rec
     s["last_recommendation"] = rec
     s["last_entry_basis"] = entry_basis
-
     mode_raw = context.bot_data.get("MODE","conservador")
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
 
     if enter:
-        txt, idx = pick_no_repeat(JUSTIFICATIVAS_ENTRADA, s.get("last_just_entry_idx", -1))
-        s["last_just_entry_idx"] = idx
-        await ia_send(
-            update, context,
-            format_reco_text(d1, d2, mode) + f"\n📖 {txt}",
-            parse_mode="Markdown",
-            reply_markup=entry_keyboard()
-        )
+        await ia_send(update, context, format_reco_text(d1, d2, mode), parse_mode="Markdown", reply_markup=entry_keyboard())
         s["pending_bet"] = {"d1": d1, "d2": d2}
-        s["gale_active"] = True
-        s["gale_level"] = 0
+        s["gale_active"] = True; s["gale_level"] = 0
     else:
         await ia_send(update, context, format_wait_text(mode), parse_mode="Markdown")
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_chat_state(update, context)
     s = context.chat_data["state"]
-    query = update.callback_query
-    data = query.data
+    query = update.callback_query; data = query.data
 
     if data == "fix_last":
         if len(s["history"]) == 0 or s["last_input"] is None:
-            await query.answer("Nada para corrigir.")
-            await query.edit_message_reply_markup()
-            await ia_typing(update, context, 0.25, 0.5)
-            await query.message.reply_text("Nada para corrigir.")
-            return
+            await query.answer("Nada para corrigir."); await query.edit_message_reply_markup()
+            await query.message.reply_text("Nada para corrigir."); return
         s["awaiting_correction"] = True
-        await query.answer()
-        await query.edit_message_reply_markup()
-        await ia_typing(update, context, 0.25, 0.5)
+        await query.answer(); await query.edit_message_reply_markup()
         await query.message.reply_text(f"✏️ Envie o número correto para substituir o último: {s['last_input']}")
 
     elif data == "reset_hist":
         win = context.bot_data.get("WINDOW", s.get("window_max", 150))
         context.chat_data["state"] = make_default_state(window_max=win)
-        await query.answer("Histórico resetado.")
-        await query.edit_message_reply_markup()
-        await ia_typing(update, context, 0.25, 0.5)
+        await query.answer("Histórico resetado."); await query.edit_message_reply_markup()
         await query.message.reply_text("🗑️ Histórico e estatísticas foram resetados.")
 
     elif data == "set_agressivo":
         context.bot_data["MODE"] = "agressivo"
-        context.bot_data["MIN_SPINS"] = 8
-        context.bot_data["P_THRESHOLD"] = 0.15
-        context.bot_data["WINDOW"] = 120
-        context.bot_data["K"] = 10
-        context.bot_data["NEED"] = 6
-        await query.answer("Modo agressivo ativado.")
-        await query.edit_message_reply_markup()
-        await ia_typing(update, context, 0.3, 0.6)
-        await query.message.reply_text("✅ Modo agressivo ativado.")
-        await ia_typing(update, context, 0.2, 0.45)
-        await query.message.reply_text(prompt_next_number_text())
+        context.bot_data["MIN_SPINS"] = 8; context.bot_data["P_THRESHOLD"] = 0.15
+        context.bot_data["WINDOW"] = 120; context.bot_data["K"] = 10; context.bot_data["NEED"] = 6
+        await query.answer("Modo agressivo ativado."); await query.edit_message_reply_markup()
+        await query.message.reply_text("✅ Modo agressivo ativado."); await query.message.reply_text(prompt_next_number_text())
 
     elif data == "set_conservador":
         context.bot_data["MODE"] = "conservador"
-        context.bot_data["MIN_SPINS"] = 25
-        context.bot_data["P_THRESHOLD"] = 0.05
-        context.bot_data["WINDOW"] = 200
-        context.bot_data["K"] = 14
-        context.bot_data["NEED"] = 9
-        await query.answer("Modo conservador ativado.")
-        await query.edit_message_reply_markup()
-        await ia_typing(update, context, 0.3, 0.6)
-        await query.message.reply_text("✅ Modo conservador ativado.")
-        await ia_typing(update, context, 0.2, 0.45)
-        await query.message.reply_text(prompt_next_number_text())
-
+        context.bot_data["MIN_SPINS"] = 25; context.bot_data["P_THRESHOLD"] = 0.05
+        context.bot_data["WINDOW"] = 200; context.bot_data["K"] = 14; context.bot_data["NEED"] = 9
+        await query.answer("Modo conservador ativado."); await query.edit_message_reply_markup()
+        await query.message.reply_text("✅ Modo conservador ativado."); await query.message.reply_text(prompt_next_number_text())
     else:
         await query.answer()
 
@@ -595,25 +424,16 @@ async def ensure_chat_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s["window_max"] = win
             recompute_counts_from_history(s)
 
-# =========================
-# Bootstrap PTB (comum aos dois modos)
-# =========================
+# ==========================================
+# BOOTSTRAP DO PTB
+# ==========================================
 def build_application() -> Application:
-    appx = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(True)
-        .build()
-    )
-    # Defaults: CONSERVADOR
+    appx = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    # Defaults: conservador
     appx.bot_data["MODE"] = "conservador"
-    appx.bot_data["MIN_SPINS"] = 25
-    appx.bot_data["P_THRESHOLD"] = 0.05
-    appx.bot_data["WINDOW"] = 200
-    appx.bot_data["K"] = 14
-    appx.bot_data["NEED"] = 9
+    appx.bot_data["MIN_SPINS"] = 25; appx.bot_data["P_THRESHOLD"] = 0.05
+    appx.bot_data["WINDOW"] = 200; appx.bot_data["K"] = 14; appx.bot_data["NEED"] = 9
 
-    # Handlers
     appx.add_handler(CommandHandler("start", start_cmd))
     appx.add_handler(CommandHandler("help", help_cmd))
     appx.add_handler(CommandHandler("modo", modo_cmd))
@@ -622,40 +442,25 @@ def build_application() -> Application:
     appx.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), number_message))
     return appx
 
-# =========================
-# Modo WEBHOOK (FastAPI)
-# =========================
+# ==========================================
+# FASTAPI (WEBHOOK) – apenas se USE_WEBHOOK=True
+# ==========================================
 if USE_WEBHOOK:
-    async def on_startup() -> None:
-        global ptb_app
-        if ptb_app is None:
-            ptb_app = build_application()
-            await ptb_app.initialize()
-            webhook_url = f"{PUBLIC_URL}/telegram/webhook"
-            # seta webhook
-            await ptb_app.bot.set_webhook(
-                url=webhook_url,
-                secret_token=WEBHOOK_SECRET,
-                allowed_updates=Update.ALL_TYPES
-            )
-            await ptb_app.start()
-            log.info("PTB inicializado e webhook configurado em %s", webhook_url)
-
     @app.on_event("startup")
     async def _startup():
-        await on_startup()
-        try:
-            routes = [getattr(r, "path", str(r)) for r in app.routes]
-            log.info("Rotas registradas: %s", routes)
-        except Exception as e:
-            log.warning("Não consegui listar rotas: %s", e)
+        global ptb_app
+        ptb_app = build_application()
+        await ptb_app.initialize()
+        webhook_url = f"{PUBLIC_URL}/telegram/webhook"
+        await ptb_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET, allowed_updates=Update.ALL_TYPES)
+        await ptb_app.start()
+        log.info("PTB inicializado e webhook configurado em %s", webhook_url)
 
     @app.on_event("shutdown")
     async def _shutdown():
         global ptb_app
         if ptb_app:
             try:
-                # Mantemos drop_pending_updates=False para não perder msgs
                 await ptb_app.bot.delete_webhook(drop_pending_updates=False)
             except Exception:
                 pass
@@ -672,10 +477,7 @@ if USE_WEBHOOK:
         return {"ok": True}
 
     @app.post("/telegram/webhook")
-    async def telegram_webhook(
-        request: "Request",
-        x_telegram_bot_api_secret_token: str = Header(None)
-    ):
+    async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str = Header(None)):
         if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
             raise HTTPException(status_code=403, detail="invalid secret")
         data = await request.json()
@@ -686,32 +488,26 @@ if USE_WEBHOOK:
             log.exception("Erro processando update: %s", e)
         return JSONResponse({"ok": True})
 
-# =========================
+# ==========================================
 # ENTRYPOINT
-# =========================
+# ==========================================
 if __name__ == "__main__":
     if RUN_MODE == "polling":
-        # === Modo Worker: long polling ===
+        # BACKGROUND WORKER (recomendado no Render)
         application = build_application()
-        # Garantir que não há webhook ativo
         async def _run():
             await application.initialize()
             try:
                 await application.bot.delete_webhook(drop_pending_updates=False)
             except Exception:
                 pass
-            # Usa a API síncrona de conveniência (segura) para polling
+            log.info("Iniciando long polling…")
             application.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
 
-        # Roda
         asyncio.run(_run())
 
     else:
-        # === Modo Webhook: Web Service com Uvicorn ===
-        if not USE_WEBHOOK:
-            log.error("RUN_MODE diferente de 'polling', mas USE_WEBHOOK não está True.")
-        else:
-            import uvicorn
-            log.info("Iniciando Uvicorn em 0.0.0.0:%s (modo webhook)", PORT)
-            # 1 worker, sem reload, lifespan on (configure também no Render)
-            uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=1, lifespan="on")
+        # WEB SERVICE (Uvicorn deve iniciar este módulo com main:app)
+        import uvicorn
+        log.info("Iniciando Uvicorn em 0.0.0.0:%s (modo webhook)", PORT)
+        uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=1, lifespan="on")
