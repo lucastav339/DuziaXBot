@@ -341,17 +341,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = "Agressivo" if mode_raw.lower().startswith("agress") else "Conservador"
 
     texto = (
-         "🤖 **iDozen // Mestre das Dúzias**\n"
-    "⟂ Sistema online · Núcleos ativos · Latência nominal\n\n"
-    f"🎛️ **Modo atual:** _{mode}_\n"
-    "— — — — — — — — — — — — — —\n"
-    "📋 **Como começar**\n"
-    "1️⃣ **Escolha o modo**  →  🎯 **Agressivo**  |  🛡️ **Conservador**\n"
-    "2️⃣ **Envie o último número** que saiu na roleta (**0–36**)\n"
-    "3️⃣ **Aguarde a análise**  →  iDozen monitora e sinaliza **ENTRADA** quando houver oportunidade\n\n"
-    "💡 **Dica rápida**\n"
-    "Se enviar um número errado, use **✏️ Corrigir último** assim que a próxima **ENTRADA** aparecer.\n\n"
-    "▶️ **Pronto?** Selecione o modo abaixo e informe o número que acabou de sair."
+     "🤖 **iDozen — Mestre das Dúzias**\n\n"
+    f"🎛️ **Modo Ativado:** _{mode}_\n\n"
+    "📋 **Como começar:**\n\n"
+    "1️⃣ **Selecione o modo de operação**  \n"
+    "  🎯 **Agressivo** ou 🛡️ **Conservador**  \n"
+    "2️⃣ **Envie o número** que saiu na roleta   \n"
+    "3️⃣ **Aguarde a análise** e receba a **recomendação** quando houver oportunidade\n\n"
+     
     )
 
     await ia_send(update, context, texto, reply_markup=mode_keyboard(), parse_mode="Markdown")
