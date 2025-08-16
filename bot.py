@@ -153,7 +153,7 @@ async def progressao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def corrigir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     if not context.args:
-        await safe_reply(update.message, "Informe o número para correção. Ex: /corrigir 17")
+        await safe_reply(update.message, "⚠️ Informe o número para correção.\n Ex: /corrigir + Número correto")
         return
     ok, num = validate_number(context.args[0])
     if not ok or num is None:
