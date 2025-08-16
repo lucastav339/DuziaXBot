@@ -61,7 +61,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎲✨ <b>Bem-vindo ao iDozen Premium</b> ✨🎲\n\n"
         "💎 <i>Experiência exclusiva em análise de roleta.</i>\n"
         "🔍 Algoritmos avançados de monitoramento.\n"
-        "🎯 Estratégias de elite, máxima precisão.\n\n"
+        "🎯 Estratégias de <b>ELITE</b>, máxima precisão.\n\n"
         "📋 <b>Como funciona:</b>\n"
         "1️⃣ Informe o <b>último número</b> que saiu (0–36).\n"
         "2️⃣ O iDozen processa padrões e tendências.\n"
