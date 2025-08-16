@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict
-
 from .state import UserState
-
 
 RESP_WAIT = (
     "⏳ Aguardando mais dados para análise.\n"
@@ -16,16 +14,22 @@ RESP_CORRECT = "\u2705 Último número corrigido para {num}.\n⚡Análise atuali
 
 
 def format_response(state: UserState, analysis: Dict[str, str]) -> str:
+    # Bandeira de gale (para exibir status)
+    gale_block = ""
+    if state.gale_enabled:
+        if state.gale_left > 0 and state.gale_dozen:
+            gale_block = f"🌀 Gale: ATIVO (1/1) na {state.gale_dozen}\n"
+        else:
+            gale_block = "🌀 Gale: pronto (1/1)\n"
+
     if analysis.get("status") == "wait":
-        # Mostra o selo de modo conservador mesmo em espera
-        conservador = "🛡️ Modo Conservador Automático: ATIVO\n" if state.conservative_boost else ""
-        return conservador + RESP_WAIT
+        return gale_block + RESP_WAIT
 
     rec = analysis.get("recommendation", "")
     excl = analysis.get("excluded", "")
     reason = analysis.get("reason", "")
     hist = analysis.get("history", "")
-    pending = analysis.get("pending", "0")
+    # pending = analysis.get("pending", "0")  # não usado visualmente
 
     perf_block = ""
     if state.current_rec:
@@ -38,21 +42,16 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
             f"• Jogadas: {plays} | ✅ Acertos: {hits} | ❌ Erros: {misses} | 🎯 Taxa: {acc}\n"
         )
 
-    conservador = "🛡️ Modo Conservador Automático: ATIVO\n" if state.conservative_boost else ""
-
     blocks = [
-        conservador.rstrip(),
-        f"✅ Recomendação: 🌟{rec}🌟 \n\ud83d\udeab Excluída: {excl}",
+        gale_block.rstrip(),
+        f"✅ Recomendação (single): 🌟{rec}🌟 \n\ud83d\udeab Excluída: {excl}",
         f"\ud83d\udcd6 Justificativa: {reason}",
         perf_block.rstrip(),
         (
             f"\ud83d\udcca Histórico (últimos 12):\n📋{hist}📋\n"
-            "✏️ Para limpar o histórico:\n"
-            "⚠️ Use o comando /reset.\n"
-            "📝 Para corrigir o número digitado:\n"
-            "⚠️ Use o comando /corrigir."
+            "✏️ Para limpar o histórico: /reset\n"
+            "📝 Para corrigir o número: /corrigir <número>"
         ),
     ]
-
     blocks = [b for b in blocks if b]
     return "\n".join(blocks)
