@@ -58,17 +58,19 @@ async def safe_reply(message, text: str, **kwargs):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update.message,
-        "🤖 *iDozen — Inteligência 100% focada em Roleta*\n\n"
-        "✅ Sistema pronto para análise completa dos números.\n"
-        "📊 Algoritmos dedicados a identificar padrões ocultos.\n"
-        "🎯 Recomendação estratégica com precisão máxima.\n\n"
-        "📋 *Como usar:*\n"
-        "1️⃣ Envie o **último número** que saiu (0–36).\n"
-        "2️⃣ Aguarde a análise em tempo real.\n"
-        "3️⃣ Receba instruções seguras para sua próxima jogada.\n\n"
-        "⚡ Digite /help para explorar todos os recursos.\n\n"
-        "⚠️ *iDozen trabalha com disciplina e estatística.*"
+        "🎲✨ <b>Bem-vindo ao iDozen Premium</b> ✨🎲\n\n"
+        "💎 <i>Sua experiência exclusiva em análise de roleta.</i>\n"
+        "🔍 Algoritmos avançados monitorando cada detalhe.\n"
+        "🎯 Estratégias de elite, entregues com máxima precisão.\n\n"
+        "📋 <b>Como funciona:</b>\n"
+        "1️⃣ Informe o <b>último número</b> que saiu (0–36).\n"
+        "2️⃣ O iDozen processa padrões e tendências ocultas.\n"
+        "3️⃣ Receba uma recomendação <i>premium e estratégica</i>.\n\n"
+        "⚡ Digite /help e descubra todas as funções exclusivas.\n\n"
+        "⚠️ <i>iDozen Premium é projetado para jogadores com disciplina.</i>",
+        parse_mode="HTML"
     )
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
