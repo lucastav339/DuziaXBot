@@ -58,7 +58,16 @@ async def safe_reply(message, text: str, **kwargs):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update.message,
-        "Envie números (0-36) para análise ou /help para comandos. Jogue com responsabilidade."
+        "🤖 **iDozen — Inteligência 100% focada em Roleta**\n\n"
+        "✅ Sistema pronto para análise completa dos números.\n"
+        "📊 Algoritmos dedicados a identificar padrões ocultos.\n"
+        "🎯 Recomendação estratégica com precisão máxima.\n\n"
+        "📋 **Como usar:**\n"
+        "1️⃣ Envie o **último número** que saiu (0–36).\n"
+        "2️⃣ Aguarde a análise em tempo real.\n"
+        "3️⃣ Receba instruções seguras para sua próxima jogada.\n\n"
+        "⚡ Digite /help para explorar todos os recursos.\n\n"
+        "⚠️ *iDozen trabalha com disciplina e estatística. Jogue com responsabilidade.*"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
