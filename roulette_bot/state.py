@@ -18,27 +18,40 @@ class UserState:
     explain_next: bool = False
 
     # --- Placar cumulativo da recomendação ---
-    current_rec: Optional[Set[str]] = None   # ex.: {"D1","D2"}
+    current_rec: Optional[Set[str]] = None   # ex.: {"D1"} (sempre single nesta versão)
     rec_plays: int = 0
     rec_hits: int = 0
     rec_misses: int = 0
 
     # --- Modo conservador automático (gatilho por acurácia) ---
-    conservative_boost: bool = False          # liga/desliga estratégia mais rígida
-    acc_trigger: float = 0.50                 # limiar (≤ 50%)
-    min_samples_for_eval: int = 8             # nº mínimo de jogadas para avaliar acurácia
+    conservative_boost: bool = False
+    acc_trigger: float = 0.50
+    min_samples_for_eval: int = 8
 
-    # --- Parâmetros da estratégia "apertada" ---
-    use_ewma: bool = True                     # ponderar por recência
-    ewma_alpha: float = 0.6                   # peso do recente
-    min_gap: int = 2                          # gap mínimo (versão ponderada) quando boost ON
-    min_support: int = 4                      # suporte mínimo na janela
-    require_recent: int = 1                   # presença mínima nos últimos K giros
-    # Controle de risco simples (opcional)
-    max_loss_streak: int = 2                  # após X erros seguidos, faz cooldown
-    cooldown_spins: int = 2                   # nº de giros sem recomendar
-    cooldown_left: int = 0                    # contador de cooldown
-    loss_streak: int = 0                      # erros consecutivos
+    # --- Parâmetros de estratégia (single-dozen) ---
+    use_ewma: bool = True
+    ewma_alpha: float = 0.6
+    min_support: int = 4          # ocorrências mínimas do candidato na janela
+    require_recent: int = 1       # presença nos últimos K giros (>=)
+    bayes_lift_min: float = 0.03  # p_posterior - base >= 3 p.p.
+    bayes_ci_q: float = 0.10      # IC ~90% (limite inferior > base)
+
+    # --- SPRT (detecção de viés real) ---
+    sprt_delta: float = 0.05      # H1 = base + 5 p.p.
+    sprt_A: float = 2.30          # limiar superior (≈ BF 10:1)
+    sprt_B: float = -2.30         # limiar inferior
+    llr: dict = field(default_factory=lambda: {"D1": 0.0, "D2": 0.0, "D3": 0.0})
+
+    # --- CUSUM (mudança de regime) ---
+    cusum: dict = field(default_factory=lambda: {"D1": 0.0, "D2": 0.0, "D3": 0.0})
+    cusum_k: float = 0.01
+    cusum_h: float = 0.20
+
+    # --- Controle de risco (opcional, já integrado ao fluxo) ---
+    max_loss_streak: int = 2
+    cooldown_spins: int = 2
+    cooldown_left: int = 0
+    loss_streak: int = 0
 
     def reset_history(self) -> None:
         self.history.clear()
@@ -60,6 +73,7 @@ class UserState:
         self.rec_misses = 0
         self.loss_streak = 0
         self.cooldown_left = 0
+        # Mantemos LLR/CUSUM para continuidade; se quiser, zere-os aqui também.
 
     def set_recommendation(self, dozens: Set[str]) -> None:
         """Atualiza a recomendação ativa SEM zerar placar (cumulativo)."""
