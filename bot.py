@@ -35,10 +35,9 @@ def de_surrogate(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
     try:
-        # Converte preservando pares surrogate e decodifica para chars reais
         return text.encode("utf-16", "surrogatepass").decode("utf-16")
     except Exception:
-        return text  # fallback: devolve como veio
+        return text  # fallback
 
 async def safe_reply(message, text: str, **kwargs):
     clean = de_surrogate(text)
@@ -200,36 +199,4 @@ async def main() -> None:
     tg_app.add_handler(CommandHandler("reset", reset))
     tg_app.add_handler(CommandHandler("explicar", explicar))
     tg_app.add_handler(CommandHandler("janela", janela))
-    tg_app.add_handler(CommandHandler("status", status))
-    tg_app.add_handler(CommandHandler("modo", modo))
-    tg_app.add_handler(CommandHandler("banca", banca))
-    tg_app.add_handler(CommandHandler("progressao", progressao))
-    tg_app.add_handler(CommandHandler("corrigir", corrigir))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
-
-    # Inicia health server e bot em paralelo
-    health_runner = await _start_health_server()
-
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.updater.start_polling(drop_pending_updates=True)
-
-    # Espera sinais para shutdown gracioso
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
-
-    try:
-        await stop_event.wait()
-    finally:
-        await tg_app.updater.stop()
-        await tg_app.stop()
-        await tg_app.shutdown()
-        await health_runner.cleanup()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    tg_app.add_handl
