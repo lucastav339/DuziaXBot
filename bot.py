@@ -67,7 +67,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "2️⃣ O iDozen processa padrões e tendências.\n"
         "3️⃣ Receba uma recomendação <i>premium</i>.\n\n"
         "⚡ Digite /help e descubra todas as funções.\n\n"
-        "⚠️      <i>iDozen Premium é projetado para jogadores com disciplina.</i>\n"
+        "💎✨ <b>Disciplina. Precisão. iDozen.</b> ✨💎\n"
         ,
         parse_mode="HTML"
     )
