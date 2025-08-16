@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import math
 import asyncio
 import signal
 import logging
@@ -17,6 +18,11 @@ from telegram.error import Conflict, NetworkError  # para logs amigáveis
 from roulette_bot.state import UserState
 from roulette_bot.analysis import analyze, validate_number, number_to_dozen
 from roulette_bot.formatting import format_response, RESP_ZERO, RESP_CORRECT
+
+# =========================
+# Constantes
+# =========================
+BASE_P = 12 / 37.0
 
 # =========================
 # Logging
@@ -71,7 +77,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML"
     )
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update.message,
@@ -82,7 +87,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     state.reset_history()
-    state.clear_recommendation()  # zera placar e risco
+    state.clear_recommendation()  # zera placar/risco (mantém LLR/CUSUM por padrão)
     state.conservative_boost = False
     await safe_reply(update.message, "Histórico e placar zerados. Modo conservador automático desativado.")
 
@@ -179,7 +184,28 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     state = get_state(update.effective_chat.id)
 
-    # 1) Computa resultado da recomendação ANTERIOR (placar + risco)
+    # =========================
+    # Atualiza evidências (SPRT + CUSUM) com o novo número (se não for zero)
+    # =========================
+    if num != 0:
+        dz = number_to_dozen(num)
+        for d in ("D1", "D2", "D3"):
+            x = 1 if d == dz else 0
+            p0 = BASE_P
+            p1 = min(0.999, BASE_P + state.sprt_delta)
+            incr = x * math.log(p1 / p0) + (1 - x) * math.log((1 - p1) / (1 - p0))
+            state.llr[d] += incr
+
+            # CUSUM negativa para detectar perda de sinal
+            y = x - BASE_P - state.cusum_k
+            state.cusum[d] = min(0.0, state.cusum[d] + y)
+            if state.cusum[d] <= -state.cusum_h:
+                state.llr[d] = 0.0
+                state.cusum[d] = 0.0
+
+    # =========================
+    # Placar da recomendação anterior
+    # =========================
     if state.current_rec and num != 0:
         dz = number_to_dozen(num)
         state.rec_plays += 1
@@ -193,22 +219,22 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 state.cooldown_left = state.cooldown_spins
                 state.loss_streak = 0
 
-    # 2) Zero: limpa somente o histórico (placar cumulativo preservado)
+    # Zero: limpa somente o histórico (placar cumulativo preservado)
     if num == 0:
         state.reset_history()
         await safe_reply(update.message, RESP_ZERO)
         return
 
-    # 3) Adiciona número ao histórico
+    # Adiciona número ao histórico
     state.add_number(num)
 
-    # 4) Se estiver em cooldown (apenas quando boost ativo), decrementar e responder WAIT
+    # Cooldown (apenas quando conservador ativo)
     if state.cooldown_left > 0:
         state.cooldown_left -= 1
         await safe_reply(update.message, format_response(state, {"status": "wait"}))
         return
 
-    # 5) Checa taxa e dispara modo conservador se necessário
+    # Gatilho do modo conservador automático
     if (state.rec_plays >= state.min_samples_for_eval
         and (state.rec_hits / max(1, state.rec_plays)) <= state.acc_trigger
         and not state.conservative_boost):
@@ -220,16 +246,16 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             parse_mode="HTML"
         )
 
-    # 6) Roda análise (adaptativa: normal vs conservadora)
+    # Análise (agora sempre retorna no máximo 1 dúzia)
     analysis = analyze(state)
 
-    # 7) Atualiza recomendação ativa SEM zerar placar
+    # Atualiza recomendação ativa (sempre single)
     if analysis.get("status") == "ok":
-        rec_text = analysis.get("recommendation", "")  # ex. "D1 + D2"
-        new_set: Set[str] = set(x.strip() for x in rec_text.split("+") if x.strip())
+        rec_text = analysis.get("recommendation", "").strip()  # ex.: "D1"
+        new_set: Set[str] = {rec_text} if rec_text else set()
         state.set_recommendation(new_set)
 
-    # 8) Responde
+    # Responde
     msg = format_response(state, analysis)
     await safe_reply(update.message, msg)
 
@@ -311,7 +337,7 @@ async def main() -> None:
         log.exception("Falha inesperada ao iniciar o bot: %s", e)
         raise
 
-    # Espera sinais para shutdown gracioso
+    # Espera por SIGINT/SIGTERM
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
