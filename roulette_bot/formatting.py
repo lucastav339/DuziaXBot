@@ -29,10 +29,10 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
     )
 
     blocks = [
-        f"✅ Recomendação: *{rec}* \n\ud83d\udeab Excluída: {excl}",
+        f"✅ Recomendação: 🌟{rec}🌟 \n\ud83d\udeab Excluída: {excl}",
         f"\ud83d\udcd6 Justificativa: {reason}",
         f"\ud83d\udcca Histórico (últimos 12):\n📋{hist}📋\n"
-         "✏️ Para limpar o histórico::\n"
+         "✏️ Para limpar o histórico:\n"
          "⚠️ Use o comando /reset.\n"
          "📝 Para corrigir o número digitado:\n"
          "⚠️ Use o comando /corrigir."
