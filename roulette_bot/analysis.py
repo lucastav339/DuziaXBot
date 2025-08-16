@@ -18,7 +18,6 @@ def number_to_dozen(num: int) -> str:
 
 
 def validate_number(text: str) -> Tuple[bool, int | None]:
-    """Validate a numeric string within roulette range."""
     try:
         n = int(text)
     except ValueError:
@@ -28,8 +27,18 @@ def validate_number(text: str) -> Tuple[bool, int | None]:
     return False, None
 
 
-def analyze(state: UserState) -> Dict[str, str]:
-    hist = list(state.history)
+def _ewma_freq(dozens: List[str], alpha: float) -> Dict[str, float]:
+    """EWMA simples: mais recentes pesam mais."""
+    acc = {"D1": 0.0, "D2": 0.0, "D3": 0.0}
+    for d in dozens:
+        for k in acc:
+            acc[k] *= (1.0 - alpha)
+        acc[d] += alpha
+    return acc
+
+
+def _analyze_conservative(state: UserState, hist: List[int]) -> Dict[str, str]:
+    """Estratégia apertada (ativa quando conservative_boost=True)."""
     window = state.window
     recent = hist[-window:]
     last12 = hist[-12:]
@@ -39,10 +48,82 @@ def analyze(state: UserState) -> Dict[str, str]:
         result["status"] = "wait"
         return result
 
-    # Frequency counts
+    dozens_recent = [number_to_dozen(n) for n in recent if n != 0]
+    if not dozens_recent:
+        result["status"] = "wait"
+        return result
+
+    # Frequência ponderada por recência
+    wf = _ewma_freq(dozens_recent, state.ewma_alpha) if state.use_ewma else None
+    raw = Counter(dozens_recent)
+
+    if wf:
+        top = sorted(wf.items(), key=lambda kv: kv[1], reverse=True)
+        top1, top1w = top[0]
+        top2w = top[1][1] if len(top) > 1 else 0.0
+        top1c = raw[top1]
+        top2c = raw[top[1][0]] if len(top) > 1 else 0
+        gap_ok = (top1w - top2w) >= float(state.min_gap)
+    else:
+        top_counts = raw.most_common()
+        top1, top1c = top_counts[0]
+        top2c = top_counts[1][1] if len(top_counts) > 1 else 0
+        gap_ok = (top1c - top2c) >= state.min_gap
+
+    # Presença recente
+    last3 = dozens_recent[-3:]
+    presence_ok = last3.count(top1) >= state.require_recent
+
+    # Suporte mínimo
+    support_ok = raw[top1] >= state.min_support
+
+    # Runs (3 últimas iguais) reforça single-dozen
+    last_dozen_all = [number_to_dozen(n) for n in hist if n != 0]
+    runs_ok = len(last_dozen_all) >= 3 and last_dozen_all[-3:] == [last_dozen_all[-1]] * 3
+
+    if runs_ok and presence_ok:
+        candidate = {top1}
+        reason = "Dominância por sequência"
+    elif gap_ok and support_ok and presence_ok:
+        candidate = {top1}
+        reason = "Gap de frequência + suporte"
+        # Se o segundo apareceu nos últimos 3, permitir dupla defensiva
+        for dz in reversed(last3):
+            if dz != top1:
+                candidate.add(dz)
+                break
+    else:
+        return {"status": "wait"}
+
+    rec = " + ".join(sorted(candidate))
+    excluded = {"D1", "D2", "D3"} - set(candidate)
+    return {
+        "status": "ok",
+        "recommendation": rec,
+        "excluded": " + ".join(sorted(excluded)) if excluded else "",
+        "reason": reason,
+        "history": ",".join(str(n) for n in last12),
+        "pending": str(max(0, window - len(recent))),
+    }
+
+
+def _analyze_original(state: UserState, hist: List[int]) -> Dict[str, str]:
+    """Aproxima a sua análise original (com pequenas proteções)."""
+    window = state.window
+    recent = hist[-window:]
+    last12 = hist[-12:]
+    result: Dict[str, str] = {}
+
+    if not hist or len(hist) < 5:
+        result["status"] = "wait"
+        return result
+
     dozens = [number_to_dozen(n) for n in recent if n != 0]
+    if not dozens:
+        result["status"] = "wait"
+        return result
+
     freq = Counter(dozens)
-    # Determine top frequencies
     if not freq:
         result["status"] = "wait"
         return result
@@ -52,7 +133,7 @@ def analyze(state: UserState) -> Dict[str, str]:
     top3c = top[-1][1]
     recommendation: List[str] = []
 
-    # Check runs
+    # Runs
     last_dozen = [number_to_dozen(n) for n in hist if n != 0]
     runs_check = []
     if len(last_dozen) >= 4:
@@ -63,22 +144,23 @@ def analyze(state: UserState) -> Dict[str, str]:
                 runs_check.append(d)
         if len(last_dozen) >= 3 and last_dozen[-3:] == [last_dozen[-1]] * 3:
             runs_check.append(last_dozen[-1])
-
     runs_check = list(set(runs_check))
 
+    # Gap
     gap_check = []
     if top1c - top3c >= 1 and top1c >= 4:
         gap_check.append(top1)
         if len(top) > 1 and top[1][1] + 1 == top1c and top[1][0] in dozens[-3:]:
             gap_check.append(top[1][0])
 
-    # Presence recent
+    # Presença recente top2
     valid_dozen = set()
     last3 = dozens[-3:]
-    for d in {d for d, _ in top[:2]}:
+    for d, _ in top[:2]:
         if d in last3:
             valid_dozen.add(d)
 
+    # Anti-overfit (como no seu)
     anti_overfit = []
     last10 = [number_to_dozen(n) for n in hist[-10:] if n != 0]
     counts10 = Counter(last10)
@@ -90,7 +172,6 @@ def analyze(state: UserState) -> Dict[str, str]:
                 co = max(others, key=others.get)
                 anti_overfit = [dom, co]
 
-    # Apply mode rules
     mode = state.mode
     if mode == "conservador":
         candidate = set(runs_check or gap_check)
@@ -99,7 +180,7 @@ def analyze(state: UserState) -> Dict[str, str]:
             candidate = set(anti_overfit)
     elif mode == "agressivo":
         candidate = set(runs_check)
-        if not candidate and top1c - (top[1][1] if len(top) > 1 else 0) >= 2:
+        if not candidate and len(top) > 1 and (top1c - top[1][1]) >= 2:
             candidate = {top1}
     else:  # neutro
         candidate = set(gap_check)
@@ -114,14 +195,15 @@ def analyze(state: UserState) -> Dict[str, str]:
     result["status"] = "ok"
     result["recommendation"] = rec
     result["excluded"] = " + ".join(sorted(excluded)) if excluded else ""
-    # Build justification message
-    if runs_check:
-        result["reason"] = "Dominância recente"
-    elif gap_check:
-        result["reason"] = "Gap de frequência"
-    else:
-        result["reason"] = "Heurística"
-
+    result["reason"] = "Dominância recente" if runs_check else ("Gap de frequência" if gap_check else "Heurística")
     result["history"] = ",".join(str(n) for n in last12)
     result["pending"] = str(max(0, window - len(recent)))
     return result
+
+
+def analyze(state: UserState) -> Dict[str, str]:
+    """Seleciona análise conforme boost conservador."""
+    hist = list(state.history)
+    if state.conservative_boost:
+        return _analyze_conservative(state, hist)
+    return _analyze_original(state, hist)
