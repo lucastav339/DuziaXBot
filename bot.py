@@ -12,6 +12,7 @@ from typing import Dict
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import Conflict, NetworkError  # para logs amigáveis
 
 from roulette_bot.state import UserState
 from roulette_bot.analysis import analyze, validate_number
@@ -189,7 +190,7 @@ def start_health_server():
                 self.send_response(404)
                 self.end_headers()
 
-        # Evita logs gigantes no Render
+        # Reduz verbosidade de log
         def log_message(self, format, *args):
             logging.getLogger("health").info("%s - %s", self.address_string(), format % args)
 
@@ -208,14 +209,17 @@ async def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
         log.error("BOT_TOKEN não definido como variável de ambiente. Defina BOT_TOKEN no Render.")
-        # Força exit “limpo” para aparecer o log e não reiniciar em loop
         raise RuntimeError("BOT_TOKEN não definido")
 
-    # Inicia /health para satisfazer Web Service (porta $PORT)
-    start_health_server()
-
+    # Constrói Application e garante que NÃO há webhook ativo (evita conflitos)
     tg_app = Application.builder().token(token).build()
+    try:
+        await tg_app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook removido e updates pendentes descartados.")
+    except Exception as e:
+        log.warning("Falha ao remover webhook (prosseguindo): %s", e)
 
+    # Handlers
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("help", help_cmd))
     tg_app.add_handler(CommandHandler("reset", reset))
@@ -228,16 +232,32 @@ async def main() -> None:
     tg_app.add_handler(CommandHandler("corrigir", corrigir))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
 
-    # Evita conflitos com webhooks antigos e esvazia updates pendentes
-    await tg_app.bot.delete_webhook(drop_pending_updates=True)
+    # Inicia /health (para Web Service no Render)
+    start_health_server()
 
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.updater.start_polling(drop_pending_updates=True)
+    # Inicializa/Start + Polling
+    try:
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.updater.start_polling(drop_pending_updates=True)
+        log.info("Bot iniciado. Polling ativo. Serviço pronto.")
+    except Conflict as e:
+        log.error(
+            "CONFLICT: Já existe OUTRA instância consumindo getUpdates com este BOT_TOKEN.\n"
+            "=> Garanta apenas 1 instância no Render (Instances=1, sem autoscaling)\n"
+            "=> Não rode localmente o mesmo token enquanto o Render estiver ativo.\n"
+            "Detalhes: %s", e
+        )
+        # Sai explicitamente para o Render não ficar em loop
+        raise SystemExit(1)
+    except NetworkError as e:
+        log.error("NetworkError ao iniciar polling: %s", e)
+        raise
+    except Exception as e:
+        log.exception("Falha inesperada ao iniciar o bot: %s", e)
+        raise
 
-    log.info("Bot iniciado. Polling ativo. Serviço pronto.")
-
-    # Espera por SIGINT/SIGTERM (Render envia)
+    # Espera por SIGINT/SIGTERM
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -258,7 +278,9 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except SystemExit as e:
+        # Encerramento previsto (ex.: Conflict)
+        raise
     except Exception as e:
         log.exception("Falha ao iniciar a aplicação: %s", e)
-        # Relevanta para ver o erro no Render; re-raise para sinalizar falha
         raise
