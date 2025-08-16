@@ -14,9 +14,9 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import Conflict, NetworkError
 
-from roulette_bot.state import UserState
-from roulette_bot.analysis import analyze, validate_number, number_to_dozen
-from roulette_bot.formatting import format_response, RESP_ZERO, RESP_CORRECT
+from state import UserState
+from analysis import analyze, validate_number, number_to_dozen
+from formatting import format_response, RESP_ZERO, RESP_CORRECT  # mantém seu design original
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +82,7 @@ async def janela(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
-    _ = analyze(state)  # só para compor info fresca se precisar
+    _ = analyze(state)  # apenas garante consistência
     gale_status = (
         f"ATIVO (1/1) na {state.gale_dozen}" if state.gale_left > 0 and state.gale_dozen
         else "pronto (1/1)"
@@ -221,7 +221,7 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         state.rec_active = False
 
     # =========================
-    # 7) Responde
+    # 7) Responde (seu formatting original cuida do layout premium)
     # =========================
     msg = format_response(state, analysis)
     await safe_reply(update.message, msg)
