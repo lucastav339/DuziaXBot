@@ -23,6 +23,23 @@ class UserState:
     rec_hits: int = 0
     rec_misses: int = 0
 
+    # --- Modo conservador automático (gatilho por acurácia) ---
+    conservative_boost: bool = False          # liga/desliga estratégia mais rígida
+    acc_trigger: float = 0.50                 # limiar (≤ 50%)
+    min_samples_for_eval: int = 8             # nº mínimo de jogadas para avaliar acurácia
+
+    # --- Parâmetros da estratégia "apertada" ---
+    use_ewma: bool = True                     # ponderar por recência
+    ewma_alpha: float = 0.6                   # peso do recente
+    min_gap: int = 2                          # gap mínimo (versão ponderada) quando boost ON
+    min_support: int = 4                      # suporte mínimo na janela
+    require_recent: int = 1                   # presença mínima nos últimos K giros
+    # Controle de risco simples (opcional)
+    max_loss_streak: int = 2                  # após X erros seguidos, faz cooldown
+    cooldown_spins: int = 2                   # nº de giros sem recomendar
+    cooldown_left: int = 0                    # contador de cooldown
+    loss_streak: int = 0                      # erros consecutivos
+
     def reset_history(self) -> None:
         self.history.clear()
 
@@ -35,13 +52,15 @@ class UserState:
         self.history[-1] = num
         return True
 
-    # Zera o placar e a recomendação ativa
     def clear_recommendation(self) -> None:
+        """Zera recomendação e placar (usado em /reset)."""
         self.current_rec = None
         self.rec_plays = 0
         self.rec_hits = 0
         self.rec_misses = 0
+        self.loss_streak = 0
+        self.cooldown_left = 0
 
-    # Atualiza a recomendação ativa SEM zerar o placar (cumulativo)
     def set_recommendation(self, dozens: Set[str]) -> None:
+        """Atualiza a recomendação ativa SEM zerar placar (cumulativo)."""
         self.current_rec = set(dozens) if dozens else None
