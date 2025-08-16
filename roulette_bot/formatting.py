@@ -6,10 +6,10 @@ from .state import UserState
 
 
 RESP_WAIT = (
-    "⏳ Aguardando mais dados para análise.\n\n"
-    "🎲 Envie o próximo número *(0–36)*.\n\n"
-    "✏️ Para corrigir o número digitado:"
-    "✨ *Use o comando* /corrigir."
+    "⏳ Aguardando mais dados para análise.\n"
+    "🎲 Envie o próximo número (0–36).\n"
+    "✏️ Para corrigir o número digitado:\n"
+    "✨ Use o comando /corrigir."
 )
 RESP_ZERO = "\u2139\ufe0f Zero detectado, leitura reiniciada."
 RESP_CORRECT = "\u2705 Último número corrigido para {num}. Análise atualizada:"
