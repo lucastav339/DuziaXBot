@@ -17,7 +17,7 @@ class UserState:
     progression: Optional[str] = None  # "martingale" or "dalembert"
     explain_next: bool = False
 
-    # --- Placar da recomendação ativa ---
+    # --- Placar cumulativo da recomendação ---
     current_rec: Optional[Set[str]] = None   # ex.: {"D1","D2"}
     rec_plays: int = 0
     rec_hits: int = 0
@@ -35,15 +35,13 @@ class UserState:
         self.history[-1] = num
         return True
 
-    # Helpers para zerar/definir recomendação
+    # Zera o placar e a recomendação ativa
     def clear_recommendation(self) -> None:
         self.current_rec = None
         self.rec_plays = 0
         self.rec_hits = 0
         self.rec_misses = 0
 
+    # Atualiza a recomendação ativa SEM zerar o placar (cumulativo)
     def set_recommendation(self, dozens: Set[str]) -> None:
-        self.current_rec = set(dozens)
-        self.rec_plays = 0
-        self.rec_hits = 0
-        self.rec_misses = 0
+        self.current_rec = set(dozens) if dozens else None
