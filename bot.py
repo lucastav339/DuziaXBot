@@ -14,9 +14,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import Conflict, NetworkError
 
-from state import UserState
-from analysis import analyze, validate_number, number_to_dozen
-from formatting import format_response, RESP_ZERO, RESP_CORRECT  # mantém seu design original
+# ===== IMPORTS CORRIGIDOS (pacote roulette_bot) =====
+from roulette_bot.state import UserState
+from roulette_bot.analysis import analyze, validate_number, number_to_dozen
+from roulette_bot.formatting import format_response, RESP_ZERO, RESP_CORRECT  # mantém seu design original
 
 logging.basicConfig(
     level=logging.INFO,
