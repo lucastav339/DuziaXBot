@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import math
 import asyncio
 import signal
 import logging
@@ -13,29 +12,18 @@ from typing import Dict, Set
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.error import Conflict, NetworkError  # para logs amigáveis
+from telegram.error import Conflict, NetworkError
 
 from roulette_bot.state import UserState
 from roulette_bot.analysis import analyze, validate_number, number_to_dozen
 from roulette_bot.formatting import format_response, RESP_ZERO, RESP_CORRECT
 
-# =========================
-# Constantes
-# =========================
-BASE_P = 12 / 37.0
-
-# =========================
-# Logging
-# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("roulette-bot")
 
-# =========================
-# Estado por usuário
-# =========================
 USER_STATES: Dict[int, UserState] = {}
 
 def get_state(chat_id: int) -> UserState:
@@ -43,9 +31,6 @@ def get_state(chat_id: int) -> UserState:
         USER_STATES[chat_id] = UserState()
     return USER_STATES[chat_id]
 
-# =========================
-# Utilitário contra UnicodeEncodeError (surrogates)
-# =========================
 def de_surrogate(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
@@ -64,37 +49,22 @@ async def safe_reply(message, text: str, **kwargs):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update.message,
-        "🎲✨ <b>Bem-vindo ao iDozen Premium</b> ✨🎲\n\n"
-        "💎 <i>Experiência exclusiva em análise de roleta.</i>\n"
-        "🔍 Algoritmos avançados de monitoramento.\n"
-        "🎯 Estratégias de <b>ELITE</b>, máxima precisão.\n\n"
-        "📋 <b>Como funciona:</b>\n"
-        "1️⃣ Informe o <b>último número</b> que saiu (0–36).\n"
-        "2️⃣ O iDozen processa padrões e tendências.\n"
-        "3️⃣ Receba uma recomendação <i>premium</i>.\n\n"
-        "⚡ Digite /help e descubra todas as funções.\n\n"
-        "💎✨ <b>Disciplina. Precisão. iDozen.</b> ✨💎\n",
+        "🎲✨ <b>iDozen</b> — estratégia single com gatilho 3 em 4 + 1 gale.\n"
+        "Envie o último número (0–36) para iniciar.",
         parse_mode="HTML"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update.message,
-        "Comandos: /start, /reset, /explicar, /janela N, /status, /modo <tipo>, "
-        "/banca on/off valor, /progressao martingale|dalembert, /corrigir X"
+        "Comandos: /start, /reset, /janela N, /status, /banca on/off valor, /corrigir X"
     )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     state.reset_history()
-    state.clear_recommendation()  # zera placar/risco (mantém LLR/CUSUM por padrão)
-    state.conservative_boost = False
-    await safe_reply(update.message, "Histórico e placar zerados. Modo conservador automático desativado.")
-
-async def explicar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = get_state(update.effective_chat.id)
-    state.explain_next = True
-    await safe_reply(update.message, "Próxima resposta terá justificativa detalhada.")
+    state.clear_recommendation()  # zera placar + gale + timers
+    await safe_reply(update.message, "Histórico e placar zerados. Gale e timers desativados.")
 
 async def janela(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
@@ -112,25 +82,20 @@ async def janela(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
-    _ = analyze(state)
-    acc = (state.rec_hits / state.rec_plays * 100) if state.rec_plays > 0 else 0.0
+    _ = analyze(state)  # só para compor info fresca se precisar
+    gale_status = (
+        f"ATIVO (1/1) na {state.gale_dozen}" if state.gale_left > 0 and state.gale_dozen
+        else "pronto (1/1)"
+    )
     msg = (
-        f"Modo: {state.mode}\n"
         f"Janela: {state.window}\n"
         f"Recomendação ativa: {sorted(state.current_rec) if state.current_rec else '—'}\n"
-        f"Placar (cumulativo): Jogadas {state.rec_plays} | Acertos {state.rec_hits} | Erros {state.rec_misses} | Taxa {acc:.1f}%\n"
-        f"Conservador automático: {'ON' if state.conservative_boost else 'OFF'}  "
-        f"(gatilho ≤ {int(state.acc_trigger*100)}%, min_jogadas={state.min_samples_for_eval})"
+        f"Placar: Jogadas {state.rec_plays} | Acertos {state.rec_hits} | Erros {state.rec_misses}\n"
+        f"Gale: {gale_status}\n"
+        f"Refratário: {state.refractory_left}/{state.refractory_spins} | "
+        f"Cooldown: {state.cooldown_left}"
     )
     await safe_reply(update.message, msg)
-
-async def modo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = get_state(update.effective_chat.id)
-    if context.args and context.args[0] in {"conservador", "agressivo", "neutro"}:
-        state.mode = context.args[0]
-        await safe_reply(update.message, f"Modo ajustado para {state.mode}.")
-    else:
-        await safe_reply(update.message, "Modos: conservador, agressivo, neutro.")
 
 async def banca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
@@ -150,19 +115,10 @@ async def banca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await safe_reply(update.message, "Uso: /banca on <valor> | /banca off")
 
-async def progressao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = get_state(update.effective_chat.id)
-    if context.args and context.args[0] in {"martingale", "dalembert"}:
-        state.progression = context.args[0]
-        await safe_reply(update.message, f"Progressão {state.progression} configurada.")
-    else:
-        state.progression = None
-        await safe_reply(update.message, "Progressão desativada.")
-
 async def corrigir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     if not context.args:
-        await safe_reply(update.message, "⚠️ Informe o número para correção.\n 👉 Ex: /corrigir + Número correto.")
+        await safe_reply(update.message, "⚠️ Informe o número para correção. Ex: /corrigir 17")
         return
     ok, num = validate_number(context.args[0])
     if not ok or num is None:
@@ -185,83 +141,86 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     state = get_state(update.effective_chat.id)
 
     # =========================
-    # Atualiza evidências (SPRT + CUSUM) com o novo número (se não for zero)
+    # 1) Placar da recomendação anterior — só se a ÚLTIMA resposta foi recomendação ativa
     # =========================
-    if num != 0:
-        dz = number_to_dozen(num)
-        for d in ("D1", "D2", "D3"):
-            x = 1 if d == dz else 0
-            p0 = BASE_P
-            p1 = min(0.999, BASE_P + state.sprt_delta)
-            incr = x * math.log(p1 / p0) + (1 - x) * math.log((1 - p1) / (1 - p0))
-            state.llr[d] += incr
-
-            # CUSUM negativa para detectar perda de sinal
-            y = x - BASE_P - state.cusum_k
-            state.cusum[d] = min(0.0, state.cusum[d] + y)
-            if state.cusum[d] <= -state.cusum_h:
-                state.llr[d] = 0.0
-                state.cusum[d] = 0.0
-
-    # =========================
-    # Placar da recomendação anterior
-    # =========================
-    if state.current_rec and num != 0:
+    if state.rec_active and state.current_rec and num != 0:
         dz = number_to_dozen(num)
         state.rec_plays += 1
         if dz in state.current_rec:
+            # ACERTO
             state.rec_hits += 1
-            state.loss_streak = 0
+            # Se estava em gale, encerra gale
+            state.gale_left = 0
+            state.gale_dozen = None
         else:
+            # ERRO
             state.rec_misses += 1
-            state.loss_streak += 1
-            if state.loss_streak >= state.max_loss_streak and state.cooldown_left == 0 and state.conservative_boost:
-                state.cooldown_left = state.cooldown_spins
-                state.loss_streak = 0
+            # Se não havia gale pendente e gale está habilitado, arma 1 gale
+            if state.gale_enabled and state.gale_left == 0 and state.current_rec:
+                # current_rec é set com 1 dúzia
+                state.gale_left = 1
+                state.gale_dozen = list(state.current_rec)[0]
+            else:
+                # Se já estava em gale (errou o gale), encerra e opcionalmente ativa refratário
+                if state.gale_left > 0:
+                    state.gale_left = 0
+                    state.gale_dozen = None
+                    if state.refractory_spins > 0:
+                        state.refractory_left = state.refractory_spins
 
-    # Zero: limpa somente o histórico (placar cumulativo preservado)
+    # =========================
+    # 2) Zero: limpa histórico e desativa rec_active/gale/timers
+    # =========================
     if num == 0:
         state.reset_history()
+        state.rec_active = False
+        state.gale_left = 0
+        state.gale_dozen = None
+        state.refractory_left = 0
         await safe_reply(update.message, RESP_ZERO)
         return
 
-    # Adiciona número ao histórico
+    # =========================
+    # 3) Adiciona número ao histórico
+    # =========================
     state.add_number(num)
 
-    # Cooldown (apenas quando conservador ativo)
+    # =========================
+    # 4) Timers → WAIT e não pontuar próxima
+    # =========================
+    if state.refractory_left > 0:
+        state.refractory_left -= 1
+        state.rec_active = False
+        await safe_reply(update.message, format_response(state, {"status": "wait"}))
+        return
     if state.cooldown_left > 0:
         state.cooldown_left -= 1
+        state.rec_active = False
         await safe_reply(update.message, format_response(state, {"status": "wait"}))
         return
 
-    # Gatilho do modo conservador automático
-    if (state.rec_plays >= state.min_samples_for_eval
-        and (state.rec_hits / max(1, state.rec_plays)) <= state.acc_trigger
-        and not state.conservative_boost):
-        state.conservative_boost = True
-        await safe_reply(
-            update.message,
-            "🛡️ Entrando em <b>modo conservador</b> para equilibrar a taxa de acerto.\n"
-            "🔧 Critérios mais rígidos temporariamente aplicados.",
-            parse_mode="HTML"
-        )
-
-    # Análise (agora sempre retorna no máximo 1 dúzia)
+    # =========================
+    # 5) Análise (aplica gale se pendente, senão 3 em 4)
+    # =========================
     analysis = analyze(state)
 
-    # Atualiza recomendação ativa (sempre single)
+    # =========================
+    # 6) Sincroniza recomendação/flag de atividade
+    # =========================
     if analysis.get("status") == "ok":
-        rec_text = analysis.get("recommendation", "").strip()  # ex.: "D1"
-        new_set: Set[str] = {rec_text} if rec_text else set()
-        state.set_recommendation(new_set)
+        rec_text = analysis.get("recommendation", "").strip()  # "D1"/"D2"/"D3"
+        state.set_recommendation(rec_text if rec_text else None)
+        state.rec_active = True
+    else:
+        state.rec_active = False
 
-    # Responde
+    # =========================
+    # 7) Responde
+    # =========================
     msg = format_response(state, analysis)
     await safe_reply(update.message, msg)
 
-# =========================
-# Health server (stdlib)
-# =========================
+# --- Health server (Render/healthcheck simples) ---
 def start_health_server():
     port = int(os.environ.get("PORT", "8000"))
 
@@ -287,31 +246,25 @@ def start_health_server():
     t = threading.Thread(target=serve, daemon=True)
     t.start()
 
-# =========================
-# Main assíncrono
-# =========================
+# --- Main assíncrono ---
 async def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        log.error("BOT_TOKEN não definido como variável de ambiente. Defina BOT_TOKEN no Render.")
+        log.error("BOT_TOKEN não definido como variável de ambiente.")
         raise RuntimeError("BOT_TOKEN não definido")
 
     tg_app = Application.builder().token(token).build()
     try:
         await tg_app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook removido e updates pendentes descartados.")
-    except Exception as e:
-        log.warning("Falha ao remover webhook (prosseguindo): %s", e)
+    except Exception:
+        pass
 
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("help", help_cmd))
     tg_app.add_handler(CommandHandler("reset", reset))
-    tg_app.add_handler(CommandHandler("explicar", explicar))
     tg_app.add_handler(CommandHandler("janela", janela))
     tg_app.add_handler(CommandHandler("status", status))
-    tg_app.add_handler(CommandHandler("modo", modo))
     tg_app.add_handler(CommandHandler("banca", banca))
-    tg_app.add_handler(CommandHandler("progressao", progressao))
     tg_app.add_handler(CommandHandler("corrigir", corrigir))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
 
@@ -321,14 +274,9 @@ async def main() -> None:
         await tg_app.initialize()
         await tg_app.start()
         await tg_app.updater.start_polling(drop_pending_updates=True)
-        log.info("Bot iniciado. Polling ativo. Serviço pronto.")
+        log.info("Bot iniciado. Polling ativo.")
     except Conflict as e:
-        log.error(
-            "CONFLICT: Já existe OUTRA instância consumindo getUpdates com este BOT_TOKEN.\n"
-            "=> Garanta apenas 1 instância no Render (Instances=1, sem autoscaling)\n"
-            "=> Não rode localmente o mesmo token enquanto o Render estiver ativo.\n"
-            "Detalhes: %s", e
-        )
+        log.error("CONFLICT: Outra instância usando o mesmo BOT_TOKEN. Detalhes: %s", e)
         raise SystemExit(1)
     except NetworkError as e:
         log.error("NetworkError ao iniciar polling: %s", e)
@@ -337,7 +285,6 @@ async def main() -> None:
         log.exception("Falha inesperada ao iniciar o bot: %s", e)
         raise
 
-    # Espera por SIGINT/SIGTERM
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -349,11 +296,9 @@ async def main() -> None:
     try:
         await stop_event.wait()
     finally:
-        log.info("Encerrando…")
         await tg_app.updater.stop()
         await tg_app.stop()
         await tg_app.shutdown()
-        log.info("Finalizado.")
 
 if __name__ == "__main__":
     try:
