@@ -60,14 +60,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.message,
         "🎲✨ <b>Bem-vindo ao iDozen Premium</b> ✨🎲\n\n"
         "💎 <i>Sua experiência exclusiva em análise de roleta.</i>\n"
-        "🔍 Algoritmos avançados monitorando cada detalhe.\n"
-        "🎯 Estratégias de elite, entregues com máxima precisão.\n\n"
+        "🔍 Algoritmos avançados de monitoramento.\n"
+        "🎯 Estratégias de elite, máxima precisão.\n\n"
         "📋 <b>Como funciona:</b>\n"
         "1️⃣ Informe o <b>último número</b> que saiu (0–36).\n"
-        "2️⃣ O iDozen processa padrões e tendências ocultas.\n"
-        "3️⃣ Receba uma recomendação <i>premium e estratégica</i>.\n\n"
+        "2️⃣ O iDozen processa padrões e tendências.\n"
+        "3️⃣ Receba uma recomendação <i>premium</i>.\n\n"
         "⚡ Digite /help e descubra todas as funções exclusivas.\n\n"
-        "⚠️ <i>iDozen Premium é projetado para jogadores com disciplina.</i>",
+       "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️      <i>iDozen Premium é projetado para jogadores com disciplina.</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━",
         parse_mode="HTML"
     )
 
