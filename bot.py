@@ -143,9 +143,8 @@ async def main() -> None:
     if not token:
         raise RuntimeError("BOT_TOKEN não definido")
 
-    app = (
-        Application.builder().token(token).build()
-    )
+    app = Application.builder().token(token).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset))
@@ -157,6 +156,9 @@ async def main() -> None:
     app.add_handler(CommandHandler("progressao", progressao))
     app.add_handler(CommandHandler("corrigir", corrigir))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
+
+    # 🚀 substitui todo o bloco manual de initialize/start/updater por isso:
+    app.run_polling(drop_pending_updates=True)
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -165,6 +167,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(main())
+    main()
