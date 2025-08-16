@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections import Counter
 from typing import Dict, List, Tuple
 
@@ -12,15 +11,12 @@ DOZEN_MAP = {
     13: "D2", 14: "D2", 15: "D2", 16: "D2", 17: "D2", 18: "D2", 19: "D2", 20: "D2", 21: "D2", 22: "D2", 23: "D2", 24: "D2",
     25: "D3", 26: "D3", 27: "D3", 28: "D3", 29: "D3", 30: "D3", 31: "D3", 32: "D3", 33: "D3", 34: "D3", 35: "D3", 36: "D3",
 }
-BASE_P = 12 / 37.0  # probabilidade base de uma dúzia na roleta europeia (~0.3243)
-
 
 def number_to_dozen(num: int) -> str:
     return DOZEN_MAP[num]
 
-
 def validate_number(text: str) -> Tuple[bool, int | None]:
-    """Validate a numeric string within roulette range."""
+    """Valida número da roleta (0–36)."""
     try:
         n = int(text)
     except ValueError:
@@ -30,138 +26,56 @@ def validate_number(text: str) -> Tuple[bool, int | None]:
     return False, None
 
 
-def _ewma_freq(dozens: List[str], alpha: float) -> Dict[str, float]:
-    """EWMA simples (mais recentes pesam mais)."""
-    acc = {"D1": 0.0, "D2": 0.0, "D3": 0.0}
-    for d in dozens:
-        for k in acc:
-            acc[k] *= (1.0 - alpha)
-        acc[d] += alpha
-    return acc
-
-
-def _dirichlet_post_probs(counts: Dict[str, int], alpha0: float) -> Dict[str, float]:
-    alphas = {d: alpha0 + counts.get(d, 0) for d in ("D1", "D2", "D3")}
-    s = sum(alphas.values())
-    return {d: alphas[d] / s for d in alphas}
-
-
-def _beta_lower_bound(successes: int, trials: int, z: float = 1.2816) -> float:
-    """Limite inferior Wilson-like para p, aproxima IC 90% (z≈1.2816)."""
-    if trials <= 0:
-        return 0.0
-    p = successes / trials
-    denom = 1.0 + (z * z) / trials
-    center = p + (z * z) / (2 * trials)
-    rad = z * math.sqrt(p * (1 - p) / trials + (z * z) / (4 * trials * trials))
-    return max(0.0, (center - rad) / denom)
-
-
-def _run_length_end(dozens_all: List[str]) -> Tuple[str | None, int]:
-    """Retorna (dúzia, comprimento) da sequência no final do histórico."""
-    if not dozens_all:
-        return None, 0
-    last = dozens_all[-1]
-    i = len(dozens_all) - 1
-    cnt = 0
-    while i >= 0 and dozens_all[i] == last:
-        cnt += 1
-        i -= 1
-    return last, cnt
+def _last_k_dozen(hist: List[int], k: int) -> List[str]:
+    """Últimos k resultados (ignorando zeros) mapeados para dúzias."""
+    dozens = [number_to_dozen(n) for n in hist if n != 0]
+    return dozens[-k:]
 
 
 def analyze(state: UserState) -> Dict[str, str]:
     """
-    Estratégia SINGLE-DOZEN:
-      - Prioriza a dúzia com maior evidência (SPRT forte > Bayes + EWMA + suporte/presença).
-      - Só retorna 1 dúzia; caso não haja evidência suficiente, retorna 'wait'.
+    Estratégia: '3 em 4' + 1 Gale
+      - Se houver gale pendente: força a mesma dúzia (1/1).
+      - Caso contrário: só recomenda se uma dúzia saiu >= 3 vezes nos últimos 4 giros.
+      - Senão: WAIT.
     """
-    # Cooldown ativo → não recomenda
-    if state.cooldown_left > 0:
+    # Regras de espera por timers
+    if state.cooldown_left > 0 or state.refractory_left > 0:
         return {"status": "wait"}
 
     hist = list(state.history)
-    window = state.window
-    recent = hist[-window:]
     last12 = hist[-12:]
 
-    if len(hist) < 5:
+    # 1) Gale pendente? Força a mesma dúzia
+    if state.gale_enabled and state.gale_left > 0 and state.gale_dozen:
+        best = state.gale_dozen
+        excluded = {"D1", "D2", "D3"} - {best}
+        return {
+            "status": "ok",
+            "recommendation": best,
+            "excluded": " + ".join(sorted(excluded)),
+            "reason": "Gale 1/1 (reentrada controlada na mesma dúzia)",
+            "history": ",".join(str(n) for n in last12),
+            "pending": "0",
+        }
+
+    # 2) Sem gale: precisa de '3 em 4'
+    tail4 = _last_k_dozen(hist, 4)
+    if len(tail4) < 4:
         return {"status": "wait"}
 
-    dozens_recent = [number_to_dozen(n) for n in recent if n != 0]
-    if not dozens_recent:
+    c4 = Counter(tail4)
+    best, cnt = c4.most_common(1)[0]
+    if cnt < 3:
         return {"status": "wait"}
 
-    counts = Counter(dozens_recent)
-    trials = len(dozens_recent)
-
-    # EWMA (ou fallback p/ contagem)
-    if state.use_ewma:
-        wf = _ewma_freq(dozens_recent, state.ewma_alpha)
-    else:
-        wf = {d: float(counts.get(d, 0)) for d in ("D1", "D2", "D3")}
-
-    # Bayes: posterior + limite inferior
-    probs = _dirichlet_post_probs(counts, alpha0=1.0)  # prior fraca padrão
-    z = 1.2816 if state.bayes_ci_q <= 0.10 else 1.6449  # 90% ou 95%
-    lb = {d: _beta_lower_bound(counts.get(d, 0), trials, z=z) for d in ("D1", "D2", "D3")}
-    lift = {d: probs[d] - BASE_P for d in ("D1", "D2", "D3")}
-
-    # Runs no final (reforço de confiança)
-    dozens_all = [number_to_dozen(n) for n in hist if n != 0]
-    end_d, end_run = _run_length_end(dozens_all)
-
-    # Ranking de candidatos (combinação simples de sinais)
-    def score(d: str) -> float:
-        # Normalizações
-        ew = wf[d]
-        ew_max = max(wf.values()) if wf else 1.0
-        ew_n = (ew / ew_max) if ew_max > 0 else 0.0
-        sprt_n = (state.llr[d] - state.sprt_B) / (state.sprt_A - state.sprt_B)
-        sprt_n = max(0.0, min(1.0, sprt_n))
-        support_n = counts.get(d, 0) / max(1, trials)
-        run_n = 1.0 if (d == end_d and end_run >= 2) else 0.0
-        lift_n = max(0.0, lift[d] / 0.2)  # escala aproximada
-
-        # Pesos (pode calibrar depois)
-        w_sprt, w_bayes, w_ewma, w_support, w_run = 1.5, 1.2, 1.0, 0.7, 0.8
-        lin = (w_sprt * sprt_n) + (w_bayes * lift_n) + (w_ewma * ew_n) + (w_support * support_n) + (w_run * run_n)
-        return lin
-
-    ranked = sorted(("D1", "D2", "D3"), key=score, reverse=True)
-    best = ranked[0]
-
-    # GATES (sempre single)
-    presence_ok = dozens_recent[-state.require_recent :].count(best) >= 1 if state.require_recent > 0 else True
-    support_ok = counts.get(best, 0) >= state.min_support
-    bayes_ok = (lift[best] >= state.bayes_lift_min) and (lb[best] > BASE_P)
-    sprt_strong = state.llr[best] >= state.sprt_A
-    runs_strong = (best == end_d and end_run >= 3)
-
-    if state.conservative_boost:
-        # Conservador: exige pelo menos SPRT forte OU (Bayes + suporte + presença)
-        if not (sprt_strong or (bayes_ok and support_ok and presence_ok)):
-            return {"status": "wait"}
-    else:
-        # Normal: exige pelo menos (SPRT forte) OU (runs fortes) OU (Bayes + suporte + presença)
-        if not (sprt_strong or runs_strong or (bayes_ok and support_ok and presence_ok)):
-            return {"status": "wait"}
-
-    # Monta resposta (sempre 1 dúzia)
-    rec_set = {best}
-    rec = next(iter(rec_set))
-    excluded = {"D1", "D2", "D3"} - rec_set
-    reason = (
-        "SPRT forte"
-        if sprt_strong
-        else ("Sequência dominante" if runs_strong else "Bayes + suporte + presença (EWMA)")
-    )
-
+    # recomendação single na dúzia dominante
+    excluded = {"D1", "D2", "D3"} - {best}
     return {
         "status": "ok",
-        "recommendation": rec,  # <- apenas 1 dúzia
-        "excluded": " + ".join(sorted(excluded)) if excluded else "",
-        "reason": reason,
+        "recommendation": best,
+        "excluded": " + ".join(sorted(excluded)),
+        "reason": "Padrão 3 em 4 (sequência validada)",
         "history": ",".join(str(n) for n in last12),
-        "pending": str(max(0, window - len(recent))),
+        "pending": "0",
     }
