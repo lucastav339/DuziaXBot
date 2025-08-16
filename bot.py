@@ -138,13 +138,12 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(msg)
 
 
-async def main() -> None:
+def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN não definido")
 
     app = Application.builder().token(token).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset))
@@ -157,13 +156,8 @@ async def main() -> None:
     app.add_handler(CommandHandler("corrigir", corrigir))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
 
-    # 🚀 substitui todo o bloco manual de initialize/start/updater por isso:
+    # Simples e robusto: bloqueia o processo e faz shutdown gracioso
     app.run_polling(drop_pending_updates=True)
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    await app.updater.wait()  # substitui o antigo app.idle()
-    await app.shutdown()
 
 
 if __name__ == "__main__":
