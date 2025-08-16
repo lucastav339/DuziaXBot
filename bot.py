@@ -149,22 +149,27 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if dz in state.current_rec:
             # ACERTO
             state.rec_hits += 1
-            # Se estava em gale, encerra gale
+            # Se estava em gale e havia um erro “recuperável”, anula aquele erro
+            if state.gale_left > 0 and state.gale_recover_miss and state.rec_misses > 0:
+                state.rec_misses -= 1  # <-- ANULA O ERRO QUE DISPAROU O GALE
+            # encerra gale e limpa flags
             state.gale_left = 0
             state.gale_dozen = None
+            state.gale_recover_miss = False
         else:
             # ERRO
             state.rec_misses += 1
-            # Se não havia gale pendente e gale está habilitado, arma 1 gale
+            # Se não havia gale pendente e gale está habilitado, arma 1 gale e marca erro “recuperável”
             if state.gale_enabled and state.gale_left == 0 and state.current_rec:
-                # current_rec é set com 1 dúzia
                 state.gale_left = 1
                 state.gale_dozen = list(state.current_rec)[0]
+                state.gale_recover_miss = True
             else:
-                # Se já estava em gale (errou o gale), encerra e opcionalmente ativa refratário
+                # Se já estava em gale (errou o gale), encerra e limpa flags; pode ativar refratário
                 if state.gale_left > 0:
                     state.gale_left = 0
                     state.gale_dozen = None
+                    state.gale_recover_miss = False
                     if state.refractory_spins > 0:
                         state.refractory_left = state.refractory_spins
 
@@ -176,6 +181,7 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         state.rec_active = False
         state.gale_left = 0
         state.gale_dozen = None
+        state.gale_recover_miss = False
         state.refractory_left = 0
         await safe_reply(update.message, RESP_ZERO)
         return
