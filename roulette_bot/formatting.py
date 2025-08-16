@@ -28,7 +28,7 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
         f"R$ {state.stake_value:.2f}" if state.stake_on else "sem stake definida"
     )
 
-    # --- Bloco de desempenho da recomendação ativa ---
+    # --- Bloco de desempenho da recomendação (placar cumulativo) ---
     perf_block = ""
     if state.current_rec:
         plays = state.rec_plays
@@ -36,7 +36,7 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
         misses = state.rec_misses
         acc = f"{(hits / plays * 100):.1f}%" if plays > 0 else "—"
         perf_block = (
-            "📊 Desempenho desta recomendação:\n"
+            "📊 Desempenho (cumulativo):\n"
             f"• Jogadas: {plays} | ✅ Acertos: {hits} | ❌ Erros: {misses} | 🎯 Taxa: {acc}\n"
         )
 
@@ -53,7 +53,5 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
         ),
     ]
 
-    # Remove strings vazias (caso perf_block não exista)
     blocks = [b for b in blocks if b]
-
     return "\n".join(blocks)
