@@ -35,9 +35,10 @@ class UserState:
     gale_max: int = 1
     gale_left: int = 0               # 0 = sem gale pendente; 1 = 1 gale a fazer
     gale_dozen: Optional[str] = None # dúzia alvo do gale (D1/D2/D3)
+    gale_recover_miss: bool = False  # <- NOVO: se True, um erro pode ser “recuperado” se o gale acertar
 
     # --- Pós-erro (opcional simples) ---
-    refractory_spins: int = 0        # se quiser “pausar” após perder o gale; 0 = desligado
+    refractory_spins: int = 0
     refractory_left: int = 0
 
     # --- Cooldown simples (não usado por padrão aqui) ---
@@ -66,6 +67,7 @@ class UserState:
         # zera gale e timers
         self.gale_left = 0
         self.gale_dozen = None
+        self.gale_recover_miss = False
         self.refractory_left = 0
         self.cooldown_left = 0
 
