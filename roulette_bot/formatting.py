@@ -28,14 +28,32 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
         f"R$ {state.stake_value:.2f}" if state.stake_on else "sem stake definida"
     )
 
+    # --- Bloco de desempenho da recomendação ativa ---
+    perf_block = ""
+    if state.current_rec:
+        plays = state.rec_plays
+        hits = state.rec_hits
+        misses = state.rec_misses
+        acc = f"{(hits / plays * 100):.1f}%" if plays > 0 else "—"
+        perf_block = (
+            "📊 Desempenho desta recomendação:\n"
+            f"• Jogadas: {plays} | ✅ Acertos: {hits} | ❌ Erros: {misses} | 🎯 Taxa: {acc}\n"
+        )
+
     blocks = [
         f"✅ Recomendação: 🌟{rec}🌟 \n\ud83d\udeab Excluída: {excl}",
         f"\ud83d\udcd6 Justificativa: {reason}",
-        f"\ud83d\udcca Histórico (últimos 12):\n📋{hist}📋\n"
-         "✏️ Para limpar o histórico:\n"
-         "⚠️ Use o comando /reset.\n"
-         "📝 Para corrigir o número digitado:\n"
-         "⚠️ Use o comando /corrigir."
-        ,
+        perf_block.rstrip(),
+        (
+            f"\ud83d\udcca Histórico (últimos 12):\n📋{hist}📋\n"
+            "✏️ Para limpar o histórico:\n"
+            "⚠️ Use o comando /reset.\n"
+            "📝 Para corrigir o número digitado:\n"
+            "⚠️ Use o comando /corrigir."
+        ),
     ]
+
+    # Remove strings vazias (caso perf_block não exista)
+    blocks = [b for b in blocks if b]
+
     return "\n".join(blocks)
