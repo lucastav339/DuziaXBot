@@ -188,7 +188,6 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # 2) Zera histórico e placar se for zero
     if num == 0:
         state.reset_history()
-        state.clear_recommendation()  # limpa placar cumulativo
         await safe_reply(update.message, RESP_ZERO)
         return
 
