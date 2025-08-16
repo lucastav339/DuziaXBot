@@ -160,7 +160,8 @@ async def main() -> None:
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    await app.idle()
+    await app.updater.wait()  # substitui o antigo app.idle()
+    await app.shutdown()
 
 
 if __name__ == "__main__":
