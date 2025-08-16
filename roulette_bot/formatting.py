@@ -36,8 +36,8 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
         misses = state.rec_misses
         acc = f"{(hits / plays * 100):.1f}%" if plays > 0 else "—"
         perf_block = (
-            "📊 Desempenho (cumulativo):\n"
-            f"• Jogadas: {plays} | ✅ Acertos: {hits} | ❌ Erros: {misses} | 🎯 Taxa: {acc}\n"
+            "📊 Desempenho:\n"
+            f"• Jogadas: {plays} | ✅ Acertos: {hits} | ❌ Erros: {misses}\n"
         )
 
     blocks = [
