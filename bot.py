@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -18,40 +19,56 @@ from roulette_bot.formatting import format_response, RESP_ZERO, RESP_CORRECT
 # =========================
 USER_STATES: Dict[int, UserState] = {}
 
-
 def get_state(chat_id: int) -> UserState:
     if chat_id not in USER_STATES:
         USER_STATES[chat_id] = UserState()
     return USER_STATES[chat_id]
 
+# =========================
+# Utilitário para evitar UnicodeEncodeError (surrogates)
+# =========================
+def de_surrogate(text: str) -> str:
+    """
+    Converte sequências \\uDxxx (surrogates) em caracteres reais.
+    Mantém o texto igual se não houver surrogates.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        # Converte preservando pares surrogate e decodifica para chars reais
+        return text.encode("utf-16", "surrogatepass").decode("utf-16")
+    except Exception:
+        return text  # fallback: devolve como veio
+
+async def safe_reply(message, text: str, **kwargs):
+    clean = de_surrogate(text)
+    await message.reply_text(clean, **kwargs)
 
 # =========================
 # Handlers de comandos
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    await safe_reply(
+        update.message,
         "Envie números (0-36) para análise ou /help para comandos. Jogue com responsabilidade."
     )
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    await safe_reply(
+        update.message,
         "Comandos: /start, /reset, /explicar, /janela N, /status, /modo <tipo>, "
         "/banca on/off valor, /progressao martingale|dalembert, /corrigir X"
     )
 
-
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     state.reset_history()
-    await update.message.reply_text("Histórico zerado.")
-
+    await safe_reply(update.message, "Histórico zerado.")
 
 async def explicar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     state.explain_next = True
-    await update.message.reply_text("Próxima resposta terá justificativa detalhada.")
-
+    await safe_reply(update.message, "Próxima resposta terá justificativa detalhada.")
 
 async def janela(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
@@ -59,83 +76,75 @@ async def janela(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             n = int(context.args[0])
         except ValueError:
-            await update.message.reply_text("Valor inválido.")
+            await safe_reply(update.message, "Valor inválido.")
             return
         if 8 <= n <= 18:
             state.window = n
-            await update.message.reply_text(f"Janela ajustada para {n} giros.")
+            await safe_reply(update.message, f"Janela ajustada para {n} giros.")
         else:
-            await update.message.reply_text("Valor deve estar entre 8 e 18.")
-
+            await safe_reply(update.message, "Valor deve estar entre 8 e 18.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
-    _ = analyze(state)  # se quiser usar algo da análise depois
+    _ = analyze(state)
     msg = (
         f"Modo: {state.mode}\n"
         f"Janela: {state.window}\n"
         f"Histórico: {list(state.history)[-12:]}\n"
         f"Frequências: (ver análise interna)"
     )
-    await update.message.reply_text(msg)
-
+    await safe_reply(update.message, msg)
 
 async def modo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     if context.args and context.args[0] in {"conservador", "agressivo", "neutro"}:
         state.mode = context.args[0]
-        await update.message.reply_text(f"Modo ajustado para {state.mode}.")
+        await safe_reply(update.message, f"Modo ajustado para {state.mode}.")
     else:
-        await update.message.reply_text("Modos: conservador, agressivo, neutro.")
-
+        await safe_reply(update.message, "Modos: conservador, agressivo, neutro.")
 
 async def banca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text(
-            "Uso: /banca on <valor> | /banca off"
-        )
+        await safe_reply(update.message, "Uso: /banca on <valor> | /banca off")
         return
     if context.args[0] == "on" and len(context.args) > 1:
         try:
             state.stake_value = float(context.args[1])
             state.stake_on = True
-            await update.message.reply_text(f"Stake ativada em {state.stake_value:.2f}.")
+            await safe_reply(update.message, f"Stake ativada em {state.stake_value:.2f}.")
         except ValueError:
-            await update.message.reply_text("Valor inválido.")
+            await safe_reply(update.message, "Valor inválido.")
     elif context.args[0] == "off":
         state.stake_on = False
-        await update.message.reply_text("Stake desativada.")
+        await safe_reply(update.message, "Stake desativada.")
     else:
-        await update.message.reply_text("Uso: /banca on <valor> | /banca off")
-
+        await safe_reply(update.message, "Uso: /banca on <valor> | /banca off")
 
 async def progressao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     if context.args and context.args[0] in {"martingale", "dalembert"}:
         state.progression = context.args[0]
-        await update.message.reply_text(f"Progressão {state.progression} configurada.")
+        await safe_reply(update.message, f"Progressão {state.progression} configurada.")
     else:
         state.progression = None
-        await update.message.reply_text("Progressão desativada.")
-
+        await safe_reply(update.message, "Progressão desativada.")
 
 async def corrigir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     if not context.args:
-        await update.message.reply_text("Informe o número para correção. Ex: /corrigir 17")
+        await safe_reply(update.message, "Informe o número para correção. Ex: /corrigir 17")
         return
     ok, num = validate_number(context.args[0])
     if not ok or num is None:
-        await update.message.reply_text("Número inválido.")
+        await safe_reply(update.message, "Número inválido.")
         return
     if state.correct_last(num):
         analysis = analyze(state)
         msg = RESP_CORRECT.format(num=num) + "\n" + format_response(state, analysis)
-        await update.message.reply_text(msg)
+        await safe_reply(update.message, msg)
     else:
-        await update.message.reply_text("Sem histórico para corrigir.")
-
+        await safe_reply(update.message, "Sem histórico para corrigir.")
 
 # =========================
 # Handler de números
@@ -144,28 +153,26 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = (update.message.text or "").strip()
     ok, num = validate_number(text)
     if not ok or num is None:
-        await update.message.reply_text("Entrada inválida. Envie apenas números de 0 a 36.")
+        await safe_reply(update.message, "Entrada inválida. Envie apenas números de 0 a 36.")
         return
 
     state = get_state(update.effective_chat.id)
 
     if num == 0:
         state.reset_history()
-        await update.message.reply_text(RESP_ZERO)
+        await safe_reply(update.message, RESP_ZERO)
         return
 
     state.add_number(num)
     analysis = analyze(state)
     msg = format_response(state, analysis)
-    await update.message.reply_text(msg)
-
+    await safe_reply(update.message, msg)
 
 # =========================
 # Health server (aiohttp)
 # =========================
 async def _health(_request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
-
 
 async def _start_health_server() -> web.AppRunner:
     app = web.Application()
@@ -177,7 +184,6 @@ async def _start_health_server() -> web.AppRunner:
     await site.start()
     return runner
 
-
 # =========================
 # Main assíncrono
 # =========================
@@ -186,7 +192,6 @@ async def main() -> None:
     if not token:
         raise RuntimeError("BOT_TOKEN não definido")
 
-    # Telegram Application
     tg_app = Application.builder().token(token).build()
 
     # Handlers
@@ -216,7 +221,6 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
-            # Em plataformas sem suporte a signals (ex.: Windows), ignorar
             pass
 
     try:
@@ -226,7 +230,6 @@ async def main() -> None:
         await tg_app.stop()
         await tg_app.shutdown()
         await health_runner.cleanup()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
