@@ -4,15 +4,27 @@ from __future__ import annotations
 import os
 import asyncio
 import signal
+import logging
+import threading
+import http.server
+import socketserver
 from typing import Dict
 
-from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from roulette_bot.state import UserState
 from roulette_bot.analysis import analyze, validate_number
 from roulette_bot.formatting import format_response, RESP_ZERO, RESP_CORRECT
+
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("roulette-bot")
 
 # =========================
 # Estado por usuário
@@ -25,26 +37,22 @@ def get_state(chat_id: int) -> UserState:
     return USER_STATES[chat_id]
 
 # =========================
-# Utilitário para evitar UnicodeEncodeError (surrogates)
+# Utilitário contra UnicodeEncodeError (surrogates)
 # =========================
 def de_surrogate(text: str) -> str:
-    """
-    Converte sequências \\uDxxx (surrogates) em caracteres reais.
-    Mantém o texto igual se não houver surrogates.
-    """
     if not isinstance(text, str):
         text = str(text)
     try:
         return text.encode("utf-16", "surrogatepass").decode("utf-16")
     except Exception:
-        return text  # fallback
+        return text
 
 async def safe_reply(message, text: str, **kwargs):
     clean = de_surrogate(text)
     await message.reply_text(clean, **kwargs)
 
 # =========================
-# Handlers de comandos
+# Handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
@@ -145,9 +153,6 @@ async def corrigir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await safe_reply(update.message, "Sem histórico para corrigir.")
 
-# =========================
-# Handler de números
-# =========================
 async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     ok, num = validate_number(text)
@@ -168,20 +173,33 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await safe_reply(update.message, msg)
 
 # =========================
-# Health server (aiohttp)
+# Health server (stdlib)
 # =========================
-async def _health(_request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok"})
+def start_health_server():
+    port = int(os.environ.get("PORT", "8000"))
 
-async def _start_health_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/health", _health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", "8000"))  # Render injeta $PORT
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    return runner
+    class HealthHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        # Evita logs gigantes no Render
+        def log_message(self, format, *args):
+            logging.getLogger("health").info("%s - %s", self.address_string(), format % args)
+
+    def serve():
+        with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
+            log.info("Health server listening on 0.0.0.0:%s", port)
+            httpd.serve_forever()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
 
 # =========================
 # Main assíncrono
@@ -189,14 +207,58 @@ async def _start_health_server() -> web.AppRunner:
 async def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
+        log.error("BOT_TOKEN não definido como variável de ambiente. Defina BOT_TOKEN no Render.")
+        # Força exit “limpo” para aparecer o log e não reiniciar em loop
         raise RuntimeError("BOT_TOKEN não definido")
+
+    # Inicia /health para satisfazer Web Service (porta $PORT)
+    start_health_server()
 
     tg_app = Application.builder().token(token).build()
 
-    # Handlers
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("help", help_cmd))
     tg_app.add_handler(CommandHandler("reset", reset))
     tg_app.add_handler(CommandHandler("explicar", explicar))
     tg_app.add_handler(CommandHandler("janela", janela))
-    tg_app.add_handl
+    tg_app.add_handler(CommandHandler("status", status))
+    tg_app.add_handler(CommandHandler("modo", modo))
+    tg_app.add_handler(CommandHandler("banca", banca))
+    tg_app.add_handler(CommandHandler("progressao", progressao))
+    tg_app.add_handler(CommandHandler("corrigir", corrigir))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
+
+    # Evita conflitos com webhooks antigos e esvazia updates pendentes
+    await tg_app.bot.delete_webhook(drop_pending_updates=True)
+
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
+
+    log.info("Bot iniciado. Polling ativo. Serviço pronto.")
+
+    # Espera por SIGINT/SIGTERM (Render envia)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
+    try:
+        await stop_event.wait()
+    finally:
+        log.info("Encerrando…")
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()
+        log.info("Finalizado.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        log.exception("Falha ao iniciar a aplicação: %s", e)
+        # Relevanta para ver o erro no Render; re-raise para sinalizar falha
+        raise
