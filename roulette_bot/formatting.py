@@ -17,18 +17,16 @@ RESP_CORRECT = "\u2705 Último número corrigido para {num}.\n⚡Análise atuali
 
 def format_response(state: UserState, analysis: Dict[str, str]) -> str:
     if analysis.get("status") == "wait":
-        return RESP_WAIT
+        # Mostra o selo de modo conservador mesmo em espera
+        conservador = "🛡️ Modo Conservador Automático: ATIVO\n" if state.conservative_boost else ""
+        return conservador + RESP_WAIT
 
     rec = analysis.get("recommendation", "")
     excl = analysis.get("excluded", "")
     reason = analysis.get("reason", "")
     hist = analysis.get("history", "")
     pending = analysis.get("pending", "0")
-    stake_msg = (
-        f"R$ {state.stake_value:.2f}" if state.stake_on else "sem stake definida"
-    )
 
-    # --- Bloco de desempenho da recomendação (placar cumulativo) ---
     perf_block = ""
     if state.current_rec:
         plays = state.rec_plays
@@ -36,11 +34,14 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
         misses = state.rec_misses
         acc = f"{(hits / plays * 100):.1f}%" if plays > 0 else "—"
         perf_block = (
-            "📊 Desempenho:\n"
-            f"• Jogadas: {plays} | ✅ Acertos: {hits} | ❌ Erros: {misses}\n"
+            "📊 Desempenho (cumulativo):\n"
+            f"• Jogadas: {plays} | ✅ Acertos: {hits} | ❌ Erros: {misses} | 🎯 Taxa: {acc}\n"
         )
 
+    conservador = "🛡️ Modo Conservador Automático: ATIVO\n" if state.conservative_boost else ""
+
     blocks = [
+        conservador.rstrip(),
         f"✅ Recomendação: 🌟{rec}🌟 \n\ud83d\udeab Excluída: {excl}",
         f"\ud83d\udcd6 Justificativa: {reason}",
         perf_block.rstrip(),
