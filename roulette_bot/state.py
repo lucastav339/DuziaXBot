@@ -11,21 +11,22 @@ class UserState:
 
     # --- Histórico ---
     history: Deque[int] = field(default_factory=lambda: deque(maxlen=100))
-    window: int = 12  # ainda mostramos últimos 12 na mensagem
+    window: int = 12  # só para exibição de últimos 12 no layout antigo
 
-    # --- Modo / flags gerais ---
+    # --- Flags gerais (mantém compatibilidade com seu design) ---
     explain_next: bool = False
+    mode: str = "conservador"   # se seu formato mostra o modo, mantemos o campo
 
-    # --- Stake (opcional; só exibição) ---
+    # --- Stake (opcional; apenas exibição se seu design usa) ---
     stake_on: bool = False
     stake_value: float = 1.0
-    progression: Optional[str] = None  # "martingale" ou "dalembert" (não usado nesta estratégia)
+    progression: Optional[str] = None  # "martingale" | "dalembert" | None
 
     # --- Recomendação atual (sempre 1 dúzia) ---
-    current_rec: Optional[Set[str]] = None   # ex.: {"D1"}
+    current_rec: Optional[Set[str]] = None   # {"D1"} | None
     rec_active: bool = False                 # TRUE se a ÚLTIMA resposta foi recomendação (não WAIT)
 
-    # --- Placar cumulativo ---
+    # --- Placar cumulativo (seu design já exibe isso) ---
     rec_plays: int = 0
     rec_hits: int = 0
     rec_misses: int = 0
@@ -34,14 +35,12 @@ class UserState:
     gale_enabled: bool = True
     gale_max: int = 1
     gale_left: int = 0               # 0 = sem gale pendente; 1 = 1 gale a fazer
-    gale_dozen: Optional[str] = None # dúzia alvo do gale (D1/D2/D3)
-    gale_recover_miss: bool = False  # <- NOVO: se True, um erro pode ser “recuperado” se o gale acertar
+    gale_dozen: Optional[str] = None # alvo (D1/D2/D3)
+    gale_recover_miss: bool = False  # se True, erro que disparou o gale será anulado se o gale acertar
 
-    # --- Pós-erro (opcional simples) ---
+    # --- Pausas simples (compatível com seu fluxo, se quiser usar) ---
     refractory_spins: int = 0
     refractory_left: int = 0
-
-    # --- Cooldown simples (não usado por padrão aqui) ---
     cooldown_spins: int = 0
     cooldown_left: int = 0
 
@@ -58,7 +57,7 @@ class UserState:
         return True
 
     def clear_recommendation(self) -> None:
-        """Zera SOMENTE a recomendação e o placar (use no /reset)."""
+        """Zera SOMENTE recomendação + placar (use no /reset)."""
         self.current_rec = None
         self.rec_active = False
         self.rec_plays = 0
