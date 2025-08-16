@@ -12,7 +12,7 @@ RESP_WAIT = (
     "✨ Use o comando /corrigir."
 )
 RESP_ZERO = "\u2139\ufe0f Zero detectado, leitura reiniciada."
-RESP_CORRECT = "\u2705 Último número corrigido para {num}.\n Análise atualizada:"
+RESP_CORRECT = "\u2705 Último número corrigido para {num}.\n⚡Análise atualizada:"
 
 
 def format_response(state: UserState, analysis: Dict[str, str]) -> str:
