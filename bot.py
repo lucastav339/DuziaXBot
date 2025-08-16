@@ -71,6 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML"
     )
 
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update.message,
@@ -81,8 +82,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     state.reset_history()
-    state.clear_recommendation()  # zera placar cumulativo e recomendação ativa
-    await safe_reply(update.message, "Histórico zerado.")
+    state.clear_recommendation()  # zera placar e risco
+    state.conservative_boost = False
+    await safe_reply(update.message, "Histórico e placar zerados. Modo conservador automático desativado.")
 
 async def explicar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
@@ -106,12 +108,14 @@ async def janela(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     _ = analyze(state)
+    acc = (state.rec_hits / state.rec_plays * 100) if state.rec_plays > 0 else 0.0
     msg = (
         f"Modo: {state.mode}\n"
         f"Janela: {state.window}\n"
-        f"Histórico: {list(state.history)[-12:]}\n"
         f"Recomendação ativa: {sorted(state.current_rec) if state.current_rec else '—'}\n"
-        f"Placar (cumulativo): Jogadas {state.rec_plays} | Acertos {state.rec_hits} | Erros {state.rec_misses}"
+        f"Placar (cumulativo): Jogadas {state.rec_plays} | Acertos {state.rec_hits} | Erros {state.rec_misses} | Taxa {acc:.1f}%\n"
+        f"Conservador automático: {'ON' if state.conservative_boost else 'OFF'}  "
+        f"(gatilho ≤ {int(state.acc_trigger*100)}%, min_jogadas={state.min_samples_for_eval})"
     )
     await safe_reply(update.message, msg)
 
@@ -160,7 +164,6 @@ async def corrigir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_reply(update.message, "Número inválido.")
         return
     if state.correct_last(num):
-        # Correções não recontam o placar retroativamente (mantém cumulativo simples).
         analysis = analyze(state)
         msg = RESP_CORRECT.format(num=num) + "\n" + format_response(state, analysis)
         await safe_reply(update.message, msg)
@@ -176,32 +179,57 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     state = get_state(update.effective_chat.id)
 
-    # 1) Primeiro, computa o resultado da recomendação ANTERIOR com este novo número
+    # 1) Computa resultado da recomendação ANTERIOR (placar + risco)
     if state.current_rec and num != 0:
         dz = number_to_dozen(num)
         state.rec_plays += 1
         if dz in state.current_rec:
             state.rec_hits += 1
+            state.loss_streak = 0
         else:
             state.rec_misses += 1
+            state.loss_streak += 1
+            if state.loss_streak >= state.max_loss_streak and state.cooldown_left == 0 and state.conservative_boost:
+                state.cooldown_left = state.cooldown_spins
+                state.loss_streak = 0
 
-    # 2) Zera histórico e placar se for zero
+    # 2) Zero: limpa somente o histórico (placar cumulativo preservado)
     if num == 0:
         state.reset_history()
         await safe_reply(update.message, RESP_ZERO)
         return
 
-    # 3) Adiciona número e roda análise
+    # 3) Adiciona número ao histórico
     state.add_number(num)
+
+    # 4) Se estiver em cooldown (apenas quando boost ativo), decrementar e responder WAIT
+    if state.cooldown_left > 0:
+        state.cooldown_left -= 1
+        await safe_reply(update.message, format_response(state, {"status": "wait"}))
+        return
+
+    # 5) Checa taxa e dispara modo conservador se necessário
+    if (state.rec_plays >= state.min_samples_for_eval
+        and (state.rec_hits / max(1, state.rec_plays)) <= state.acc_trigger
+        and not state.conservative_boost):
+        state.conservative_boost = True
+        await safe_reply(
+            update.message,
+            "🛡️ Entrando em <b>modo conservador</b> para equilibrar a taxa de acerto.\n"
+            "🔧 Critérios mais rígidos temporariamente aplicados.",
+            parse_mode="HTML"
+        )
+
+    # 6) Roda análise (adaptativa: normal vs conservadora)
     analysis = analyze(state)
 
-    # 4) Atualiza a recomendação ativa SEM zerar o placar (cumulativo)
+    # 7) Atualiza recomendação ativa SEM zerar placar
     if analysis.get("status") == "ok":
         rec_text = analysis.get("recommendation", "")  # ex. "D1 + D2"
         new_set: Set[str] = set(x.strip() for x in rec_text.split("+") if x.strip())
         state.set_recommendation(new_set)
 
-    # 5) Responde com formatação (inclui bloco de desempenho cumulativo)
+    # 8) Responde
     msg = format_response(state, analysis)
     await safe_reply(update.message, msg)
 
@@ -222,7 +250,6 @@ def start_health_server():
                 self.send_response(404)
                 self.end_headers()
 
-        # Reduz verbosidade de log
         def log_message(self, format, *args):
             logging.getLogger("health").info("%s - %s", self.address_string(), format % args)
 
@@ -243,7 +270,6 @@ async def main() -> None:
         log.error("BOT_TOKEN não definido como variável de ambiente. Defina BOT_TOKEN no Render.")
         raise RuntimeError("BOT_TOKEN não definido")
 
-    # Constrói Application e garante que NÃO há webhook ativo (evita conflitos)
     tg_app = Application.builder().token(token).build()
     try:
         await tg_app.bot.delete_webhook(drop_pending_updates=True)
@@ -251,7 +277,6 @@ async def main() -> None:
     except Exception as e:
         log.warning("Falha ao remover webhook (prosseguindo): %s", e)
 
-    # Handlers
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("help", help_cmd))
     tg_app.add_handler(CommandHandler("reset", reset))
@@ -264,10 +289,8 @@ async def main() -> None:
     tg_app.add_handler(CommandHandler("corrigir", corrigir))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
 
-    # Inicia /health (para Web Service no Render)
     start_health_server()
 
-    # Inicializa/Start + Polling
     try:
         await tg_app.initialize()
         await tg_app.start()
@@ -288,7 +311,7 @@ async def main() -> None:
         log.exception("Falha inesperada ao iniciar o bot: %s", e)
         raise
 
-    # Espera por SIGINT/SIGTERM
+    # Espera sinais para shutdown gracioso
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
