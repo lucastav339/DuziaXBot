@@ -31,7 +31,7 @@ def format_response(state: UserState, analysis: Dict[str, str]) -> str:
     blocks = [
         f"✅ Recomendação: {rec} \n\ud83d\udeab Excluída: {excl}",
         f"\ud83d\udcd6 Justificativa: {reason}",
-        f"\ud83d\udcca Histórico (últimos 12): 📋{hist}📋\n\ud83d\udd01 Pendentes: {pending}"
+        f"\ud83d\udcca Histórico (últimos 12):\n📋{hist}📋\n\ud83d\udd01 Pendentes: {pending}"
         ,
     ]
     return "\n".join(blocks)
