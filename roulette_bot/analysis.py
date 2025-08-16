@@ -5,7 +5,6 @@ from typing import Dict, List, Tuple
 
 from .state import UserState
 
-
 DOZEN_MAP = {
     1: "D1", 2: "D1", 3: "D1", 4: "D1", 5: "D1", 6: "D1", 7: "D1", 8: "D1", 9: "D1", 10: "D1", 11: "D1", 12: "D1",
     13: "D2", 14: "D2", 15: "D2", 16: "D2", 17: "D2", 18: "D2", 19: "D2", 20: "D2", 21: "D2", 22: "D2", 23: "D2", 24: "D2",
@@ -25,21 +24,19 @@ def validate_number(text: str) -> Tuple[bool, int | None]:
         return True, n
     return False, None
 
-
 def _last_k_dozen(hist: List[int], k: int) -> List[str]:
     """Últimos k resultados (ignorando zeros) mapeados para dúzias."""
     dozens = [number_to_dozen(n) for n in hist if n != 0]
     return dozens[-k:]
-
 
 def analyze(state: UserState) -> Dict[str, str]:
     """
     Estratégia: '3 em 4' + 1 Gale
       - Se houver gale pendente: força a mesma dúzia (1/1).
       - Caso contrário: só recomenda se uma dúzia saiu >= 3 vezes nos últimos 4 giros.
-      - Senão: WAIT.
+      - Senão: WAIT (mantém seu design).
     """
-    # Regras de espera por timers
+    # Respeita timers (se você usa cooldown/refratário no bot)
     if state.cooldown_left > 0 or state.refractory_left > 0:
         return {"status": "wait"}
 
