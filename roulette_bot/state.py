@@ -17,7 +17,7 @@ class UserState:
     explain_next: bool = False
 
     # --- Placar cumulativo da recomendação ---
-    current_rec: Optional[Set[str]] = None   # ex.: {"D1"}
+    current_rec: Optional[Set[str]] = None   # ex.: {"D2","D3"} (invertida)
     rec_plays: int = 0
     rec_hits: int = 0
     rec_misses: int = 0
@@ -25,28 +25,29 @@ class UserState:
     # --- Modo conservador automático (gatilho por acurácia) ---
     conservative_boost: bool = False          # liga/desliga estratégia mais rígida
     acc_trigger: float = 0.50                 # limiar (≤ 50%)
-    min_samples_for_eval: int = 12            # nº mínimo de jogadas para avaliar acurácia (ajuste fino)
+    min_samples_for_eval: int = 12            # nº mínimo de jogadas para avaliar acurácia
 
-    # --- Parâmetros da estratégia (normal/boost) ---
+    # --- Parâmetros da estratégia (ajuste fino) ---
     use_ewma: bool = True                     # ponderar por recência
-    ewma_alpha: float = 0.60                  # peso do recente (ajuste fino)
+    ewma_alpha: float = 0.60                  # peso do recente
     min_support: int = 4                      # suporte mínimo na janela
     require_recent: int = 1                   # presença mínima nos últimos K giros
+    min_gap_wf_normal: float = 0.10           # gap ponderado (normal)
+    min_gap_wf_boost: float = 0.12            # gap ponderado (boost)
 
-    # Gap mínimo quando usa EWMA (fração 0..1)
-    min_gap_wf_normal: float = 0.10           # normal (ajuste fino)
-    min_gap_wf_boost: float = 0.12            # boost (mais rígido) (ajuste fino)
-
-    # Controle de risco simples (opcional)
+    # Controle de risco simples
     max_loss_streak: int = 2                  # após X erros seguidos, faz cooldown
     cooldown_spins: int = 2                   # nº de giros sem recomendar
     cooldown_left: int = 0                    # contador de cooldown
     loss_streak: int = 0                      # erros consecutivos
 
-    # Ritmo: no máx. 1 entrada a cada 2 giros
+    # Ritmo: no máx. 1 entrada a cada 2 giros (padrão)
     min_spins_between_entries: int = 2
     spin_count: int = 0
     last_entry_spin: int = -10**9
+
+    # Aposta aberta? (controla quando contar o próximo resultado)
+    has_open_rec: bool = False
 
     def reset_history(self) -> None:
         self.history.clear()
@@ -68,6 +69,7 @@ class UserState:
         self.rec_misses = 0
         self.loss_streak = 0
         self.cooldown_left = 0
+        self.has_open_rec = False
 
     def set_recommendation(self, dozens: Set[str]) -> None:
         """Atualiza a recomendação ativa SEM zerar placar (cumulativo)."""
