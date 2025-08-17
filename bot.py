@@ -71,7 +71,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML"
     )
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_reply(
         update.message,
@@ -199,12 +198,18 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, RESP_ZERO)
         return
 
-    # 3) Adiciona número ao histórico
+    # 3) Adiciona número ao histórico + incrementa contador de giros
     state.add_number(num)
+    state.spin_count += 1
 
     # 4) Se estiver em cooldown (apenas quando boost ativo), decrementar e responder WAIT
     if state.cooldown_left > 0:
         state.cooldown_left -= 1
+        await safe_reply(update.message, format_response(state, {"status": "wait"}))
+        return
+
+    # 4.1) Throttle de ritmo: no máx. 1 entrada a cada 2 giros
+    if state.spin_count - state.last_entry_spin < state.min_spins_between_entries:
         await safe_reply(update.message, format_response(state, {"status": "wait"}))
         return
 
@@ -225,9 +230,10 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # 7) Atualiza recomendação ativa SEM zerar placar
     if analysis.get("status") == "ok":
-        rec_text = analysis.get("recommendation", "")  # ex. "D1 + D2"
+        rec_text = analysis.get("recommendation", "")  # ex. "D1"
         new_set: Set[str] = set(x.strip() for x in rec_text.split("+") if x.strip())
         state.set_recommendation(new_set)
+        state.last_entry_spin = state.spin_count  # marca última entrada
 
     # 8) Responde
     msg = format_response(state, analysis)
@@ -253,87 +259,52 @@ def start_health_server():
         def log_message(self, format, *args):
             logging.getLogger("health").info("%s - %s", self.address_string(), format % args)
 
-    def serve():
-        with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
-            log.info("Health server listening on 0.0.0.0:%s", port)
+    def _serve():
+        with socketserver.TCPServer(("", port), HealthHandler) as httpd:
             httpd.serve_forever()
 
-    t = threading.Thread(target=serve, daemon=True)
+    t = threading.Thread(target=_serve, daemon=True)
     t.start()
 
-# =========================
-# Main assíncrono
-# =========================
-async def main() -> None:
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        log.error("BOT_TOKEN não definido como variável de ambiente. Defina BOT_TOKEN no Render.")
-        raise RuntimeError("BOT_TOKEN não definido")
+async def run(token: str):
+    app = Application.builder().token(token).build()
 
-    tg_app = Application.builder().token(token).build()
-    try:
-        await tg_app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook removido e updates pendentes descartados.")
-    except Exception as e:
-        log.warning("Falha ao remover webhook (prosseguindo): %s", e)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("explicar", explicar))
+    app.add_handler(CommandHandler("janela", janela))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("modo", modo))
+    app.add_handler(CommandHandler("banca", banca))
+    app.add_handler(CommandHandler("progressao", progressao))
+    app.add_handler(CommandHandler("corrigir", corrigir))
 
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("help", help_cmd))
-    tg_app.add_handler(CommandHandler("reset", reset))
-    tg_app.add_handler(CommandHandler("explicar", explicar))
-    tg_app.add_handler(CommandHandler("janela", janela))
-    tg_app.add_handler(CommandHandler("status", status))
-    tg_app.add_handler(CommandHandler("modo", modo))
-    tg_app.add_handler(CommandHandler("banca", banca))
-    tg_app.add_handler(CommandHandler("progressao", progressao))
-    tg_app.add_handler(CommandHandler("corrigir", corrigir))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number))
 
     start_health_server()
 
     try:
-        await tg_app.initialize()
-        await tg_app.start()
-        await tg_app.updater.start_polling(drop_pending_updates=True)
-        log.info("Bot iniciado. Polling ativo. Serviço pronto.")
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        await asyncio.Event().wait()
     except Conflict as e:
-        log.error(
-            "CONFLICT: Já existe OUTRA instância consumindo getUpdates com este BOT_TOKEN.\n"
-            "=> Garanta apenas 1 instância no Render (Instances=1, sem autoscaling)\n"
-            "=> Não rode localmente o mesmo token enquanto o Render estiver ativo.\n"
-            "Detalhes: %s", e
-        )
-        raise SystemExit(1)
+        log.error("Outro processo do bot está ativo (Conflict): %s", e)
     except NetworkError as e:
-        log.error("NetworkError ao iniciar polling: %s", e)
-        raise
-    except Exception as e:
-        log.exception("Falha inesperada ao iniciar o bot: %s", e)
-        raise
-
-    # Espera sinais para shutdown gracioso
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
-
-    try:
-        await stop_event.wait()
+        log.error("Erro de rede: %s", e)
     finally:
-        log.info("Encerrando…")
-        await tg_app.updater.stop()
-        await tg_app.stop()
-        await tg_app.shutdown()
-        log.info("Finalizado.")
+        await app.stop()
+        await app.shutdown()
+
+def main():
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("BOT_TOKEN não definido.")
+    try:
+        asyncio.run(run(token))
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except SystemExit:
-        raise
-    except Exception as e:
-        log.exception("Falha ao iniciar a aplicação: %s", e)
-        raise
+    main()
