@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from collections import deque
 from typing import Deque, Optional, Set
 
-
 @dataclass
 class UserState:
     """State information for a single user."""
@@ -18,7 +17,7 @@ class UserState:
     explain_next: bool = False
 
     # --- Placar cumulativo da recomendação ---
-    current_rec: Optional[Set[str]] = None   # ex.: {"D1","D2"}
+    current_rec: Optional[Set[str]] = None   # ex.: {"D1"}
     rec_plays: int = 0
     rec_hits: int = 0
     rec_misses: int = 0
@@ -26,19 +25,28 @@ class UserState:
     # --- Modo conservador automático (gatilho por acurácia) ---
     conservative_boost: bool = False          # liga/desliga estratégia mais rígida
     acc_trigger: float = 0.50                 # limiar (≤ 50%)
-    min_samples_for_eval: int = 8             # nº mínimo de jogadas para avaliar acurácia
+    min_samples_for_eval: int = 12            # nº mínimo de jogadas para avaliar acurácia (ajuste fino)
 
-    # --- Parâmetros da estratégia "apertada" ---
+    # --- Parâmetros da estratégia (normal/boost) ---
     use_ewma: bool = True                     # ponderar por recência
-    ewma_alpha: float = 0.6                   # peso do recente
-    min_gap: int = 2                          # gap mínimo (versão ponderada) quando boost ON
+    ewma_alpha: float = 0.60                  # peso do recente (ajuste fino)
     min_support: int = 4                      # suporte mínimo na janela
     require_recent: int = 1                   # presença mínima nos últimos K giros
+
+    # Gap mínimo quando usa EWMA (fração 0..1)
+    min_gap_wf_normal: float = 0.10           # normal (ajuste fino)
+    min_gap_wf_boost: float = 0.12            # boost (mais rígido) (ajuste fino)
+
     # Controle de risco simples (opcional)
     max_loss_streak: int = 2                  # após X erros seguidos, faz cooldown
     cooldown_spins: int = 2                   # nº de giros sem recomendar
     cooldown_left: int = 0                    # contador de cooldown
     loss_streak: int = 0                      # erros consecutivos
+
+    # Ritmo: no máx. 1 entrada a cada 2 giros
+    min_spins_between_entries: int = 2
+    spin_count: int = 0
+    last_entry_spin: int = -10**9
 
     def reset_history(self) -> None:
         self.history.clear()
