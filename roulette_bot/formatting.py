@@ -15,7 +15,6 @@ RESP_CORRECT = "\u2705 Último número corrigido para {num}.\n⚡Análise atuali
 
 def format_response(state: UserState, analysis: Dict[str, str]) -> str:
     if analysis.get("status") == "wait":
-        # Mostra o selo de modo conservador mesmo em espera
         conservador = "🛡️ Modo Conservador Automático: ATIVO\n" if state.conservative_boost else ""
         return conservador + RESP_WAIT
 
