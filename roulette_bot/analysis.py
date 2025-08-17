@@ -40,7 +40,7 @@ def _choose_single_from_gap_and_filters(
     require_recent: int,
 ) -> Tuple[str | None, Dict[str, float], Counter]:
     """
-    Retorna (dozen_escolhida | None, wf, raw)
+    Retorna (dozen_base | None, wf, raw)
     - wf: pesos EWMA
     - raw: contagem bruta na janela
     """
@@ -63,8 +63,15 @@ def _choose_single_from_gap_and_filters(
         return top1, wf, raw
     return None, wf, raw
 
+def _invert_to_two(dozen_base: str) -> Tuple[str, str]:
+    """Retorna (recomendacao_com_duas, excluida_base)."""
+    others = {"D1", "D2", "D3"} - {dozen_base}
+    rec = " + ".join(sorted(others))
+    excl = dozen_base
+    return rec, excl
+
 def _analyze_conservative(state: UserState, hist: List[int]) -> Dict[str, str]:
-    """Estratégia apertada (ativa quando conservative_boost=True). Sempre SINGLE."""
+    """Modo conservador automático (critérios mais rígidos) — saída invertida (2 dúzias)."""
     window = state.window
     recent = hist[-window:]
     last12 = hist[-12:]
@@ -79,49 +86,45 @@ def _analyze_conservative(state: UserState, hist: List[int]) -> Dict[str, str]:
         result["status"] = "wait"
         return result
 
-    # Runs (3 últimas iguais) -> single
-    last_dozen_all = [number_to_dozen(n) for n in hist if n != 0]
-    runs_ok = len(last_dozen_all) >= 3 and last_dozen_all[-3:] == [last_dozen_all[-1]] * 3
-
-    if runs_ok:
-        choice = last_dozen_all[-1]
-        last3 = dozens_recent[-3:]
-        if last3.count(choice) >= max(1, state.require_recent):
-            rec = choice
-            excluded = {"D1", "D2", "D3"} - {rec}
+    # RUN forte (3 últimas iguais) define dúzia-base
+    last_all = [number_to_dozen(n) for n in hist if n != 0]
+    if len(last_all) >= 3 and last_all[-3:] == [last_all[-1]] * 3:
+        base = last_all[-1]
+        # presença recente mínima (>=1) para validar
+        if dozens_recent[-3:].count(base) >= max(1, state.require_recent):
+            rec, excl = _invert_to_two(base)
             return {
                 "status": "ok",
                 "recommendation": rec,
-                "excluded": " + ".join(sorted(excluded)),
-                "reason": "Dominância por sequência",
+                "excluded": excl,
+                "reason": f"Inversão do sinal base (RUN em {base})",
                 "history": ",".join(str(n) for n in last12),
                 "pending": str(max(0, window - len(recent))),
             }
 
-    # EWMA + filtros (mais rígido no boost)
-    choice, wf, raw = _choose_single_from_gap_and_filters(
+    # EWMA + filtros (gap mais rígido)
+    base, wf, raw = _choose_single_from_gap_and_filters(
         dozens_recent=dozens_recent,
         ewma_alpha=state.ewma_alpha,
         gap_threshold=state.min_gap_wf_boost,
         min_support=state.min_support,
         require_recent=state.require_recent,
     )
-    if not choice:
+    if not base:
         return {"status": "wait"}
 
-    rec = choice
-    excluded = {"D1", "D2", "D3"} - {rec}
+    rec, excl = _invert_to_two(base)
     return {
         "status": "ok",
         "recommendation": rec,
-        "excluded": " + ".join(sorted(excluded)),
-        "reason": "Gap de frequência + suporte",
+        "excluded": excl,
+        "reason": f"Inversão do sinal base (EWMA+gap em {base})",
         "history": ",".join(str(n) for n in last12),
         "pending": str(max(0, window - len(recent))),
     }
 
 def _analyze_original(state: UserState, hist: List[int]) -> Dict[str, str]:
-    """Estratégia normal (sempre SINGLE): prioridade RUN forte, senão EWMA+gap."""
+    """Estratégia normal (ajuste fino) — encontra 1 dúzia base e INVERTE na saída."""
     window = state.window
     recent = hist[-window:]
     last12 = hist[-12:]
@@ -136,68 +139,64 @@ def _analyze_original(state: UserState, hist: List[int]) -> Dict[str, str]:
         result["status"] = "wait"
         return result
 
-    # 1) RUN forte (3 últimas iguais OU 3 em 4 com as 2 últimas iguais)
-    last_dozen = [number_to_dozen(n) for n in hist if n != 0]
-    run_choice: str | None = None
-    if len(last_dozen) >= 3 and last_dozen[-3:] == [last_dozen[-1]] * 3:
-        run_choice = last_dozen[-1]
-    elif len(last_dozen) >= 4:
-        last4 = last_dozen[-4:]
+    # 1) RUN forte: 3 últimas iguais OU 3 em 4 com as 2 últimas iguais
+    last_all = [number_to_dozen(n) for n in hist if n != 0]
+    base: str | None = None
+    if len(last_all) >= 3 and last_all[-3:] == [last_all[-1]] * 3:
+        base = last_all[-1]
+    elif len(last_all) >= 4:
+        last4 = last_all[-4:]
         counts4 = Counter(last4)
         for d, c in counts4.items():
             if c >= 3 and last4[-1] == last4[-2] == d:
-                run_choice = d
+                base = d
                 break
 
-    if run_choice:
-        # validar presença recente
-        last3 = dozens_recent[-3:]
-        if last3.count(run_choice) >= max(1, state.require_recent):
-            rec = run_choice
-            excluded = {"D1", "D2", "D3"} - {rec}
+    if base:
+        # presença recente mínima (>=1)
+        if dozens_recent[-3:].count(base) >= max(1, state.require_recent):
+            rec, excl = _invert_to_two(base)
             return {
                 "status": "ok",
                 "recommendation": rec,
-                "excluded": " + ".join(sorted(excluded)),
-                "reason": "Dominância recente",
+                "excluded": excl,
+                "reason": f"Inversão do sinal base (RUN em {base})",
                 "history": ",".join(str(n) for n in last12),
                 "pending": str(max(0, window - len(recent))),
             }
 
     # 2) EWMA + gap (normal)
-    choice, wf, raw = _choose_single_from_gap_and_filters(
+    base, wf, raw = _choose_single_from_gap_and_filters(
         dozens_recent=dozens_recent,
         ewma_alpha=state.ewma_alpha,
         gap_threshold=state.min_gap_wf_normal,
         min_support=state.min_support,
         require_recent=state.require_recent,
     )
-    if not choice:
+    if not base:
         return {"status": "wait"}
 
-    # Anti-overfit single (domina muito os últimos 10)
+    # Anti-overfit (domina muito últimos 10) — ainda define a base
     last10 = [number_to_dozen(n) for n in hist[-10:] if n != 0]
     counts10 = Counter(last10)
     if counts10:
         dom, domc = counts10.most_common(1)[0]
         others = {d: c for d, c in counts10.items() if d != dom}
         if domc >= 5 and all(c < 3 for c in others.values()):
-            # mantém single no dominante
-            choice = dom
+            base = dom
 
-    rec = choice
-    excluded = {"D1", "D2", "D3"} - {rec}
+    rec, excl = _invert_to_two(base)
     return {
         "status": "ok",
-        "recommendation": rec,
-        "excluded": " + ".join(sorted(excluded)),
-        "reason": "Gap de frequência + suporte" if not run_choice else "Dominância recente",
+        "recommendation": rec,            # ex.: "D2 + D3"
+        "excluded": excl,                 # ex.: "D1" (base)
+        "reason": f"Inversão do sinal base (EWMA+gap em {base})",
         "history": ",".join(str(n) for n in last12),
         "pending": str(max(0, window - len(recent))),
     }
 
 def analyze(state: UserState) -> Dict[str, str]:
-    """Seleciona análise conforme boost conservador."""
+    """Seleciona análise conforme boost conservador (sempre saída invertida)."""
     hist = list(state.history)
     if state.conservative_boost:
         return _analyze_conservative(state, hist)
