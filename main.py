@@ -1,0 +1,1 @@
+<cole aqui o código final que inclui MODO GOD + mensagens premium>
