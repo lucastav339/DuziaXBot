@@ -4,7 +4,6 @@ from typing import Dict
 
 from .state import UserState
 
-
 RESP_WAIT = (
     "⏳ Aguardando mais dados para análise.\n"
     "🎲 Envie o próximo número (0–36).\n"
@@ -13,7 +12,6 @@ RESP_WAIT = (
 )
 RESP_ZERO = "\u2139\ufe0f Zero detectado, leitura reiniciada."
 RESP_CORRECT = "\u2705 Último número corrigido para {num}.\n⚡Análise atualizada:"
-
 
 def format_response(state: UserState, analysis: Dict[str, str]) -> str:
     if analysis.get("status") == "wait":
