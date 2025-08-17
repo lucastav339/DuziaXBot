@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: icolor-bot-worker
+    env: python
+    plan: free
+    buildCommand: "pip install --upgrade --no-cache-dir -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
