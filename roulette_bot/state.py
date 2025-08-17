@@ -26,7 +26,7 @@ class UserState:
     # --- Modo conservador automático (gatilho por acurácia) ---
     conservative_boost: bool = False          # liga/desliga estratégia mais rígida
     acc_trigger: float = 0.50                 # limiar (≤ 50%)
-    min_samples_for_eval: int = 8             # nº mínimo de jogadas para avaliar acurácia
+    min_samples_for_eval: int = 20            # nº mínimo de jogadas para avaliar acurácia
 
     # --- Parâmetros da estratégia "apertada" ---
     use_ewma: bool = True                     # ponderar por recência
