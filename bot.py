@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import asyncio
-import signal
 import logging
 import threading
 import http.server
@@ -12,7 +11,7 @@ from typing import Dict, Set
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.error import Conflict, NetworkError  # para logs amigáveis
+from telegram.error import Conflict, NetworkError  # logs amigáveis
 
 from roulette_bot.state import UserState
 from roulette_bot.analysis import analyze, validate_number, number_to_dozen
@@ -106,12 +105,12 @@ async def janela(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
-    _ = analyze(state)
+    _ = analyze(state)  # força atualização de status interno, se necessário
     acc = (state.rec_hits / state.rec_plays * 100) if state.rec_plays > 0 else 0.0
     msg = (
         f"Modo: {state.mode}\n"
         f"Janela: {state.window}\n"
-        f"Recomendação ativa: {sorted(state.current_rec) if state.current_rec else '—'}\n"
+        f"Recomendação aberta: {sorted(state.current_rec) if state.current_rec else '—'}\n"
         f"Placar (cumulativo): Jogadas {state.rec_plays} | Acertos {state.rec_hits} | Erros {state.rec_misses} | Taxa {acc:.1f}%\n"
         f"Conservador automático: {'ON' if state.conservative_boost else 'OFF'}  "
         f"(gatilho ≤ {int(state.acc_trigger*100)}%, min_jogadas={state.min_samples_for_eval})"
@@ -122,6 +121,15 @@ async def modo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     if context.args and context.args[0] in {"conservador", "agressivo", "neutro"}:
         state.mode = context.args[0]
+        # Ajustes de throttle/boost por modo (padrões do ajuste fino; agressivo pode afrouxar throttle)
+        if state.mode == "agressivo":
+            state.min_spins_between_entries = 1
+            state.acc_trigger = 0.50
+            state.min_samples_for_eval = 12
+        else:
+            state.min_spins_between_entries = 2
+            state.acc_trigger = 0.50
+            state.min_samples_for_eval = 12
         await safe_reply(update.message, f"Modo ajustado para {state.mode}.")
     else:
         await safe_reply(update.message, "Modos: conservador, agressivo, neutro.")
@@ -178,8 +186,8 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     state = get_state(update.effective_chat.id)
 
-    # 1) Computa resultado da recomendação ANTERIOR (placar + risco)
-    if state.current_rec and num != 0:
+    # 1) Computa resultado da recomendação ANTERIOR SOMENTE se havia aposta aberta
+    if state.has_open_rec and state.current_rec and num != 0:
         dz = number_to_dozen(num)
         state.rec_plays += 1
         if dz in state.current_rec:
@@ -191,6 +199,9 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if state.loss_streak >= state.max_loss_streak and state.cooldown_left == 0 and state.conservative_boost:
                 state.cooldown_left = state.cooldown_spins
                 state.loss_streak = 0
+        # fecha a aposta aberta para não contar de novo em espera
+        state.has_open_rec = False
+        state.current_rec = None
 
     # 2) Zero: limpa somente o histórico (placar cumulativo preservado)
     if num == 0:
@@ -208,7 +219,7 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, format_response(state, {"status": "wait"}))
         return
 
-    # 4.1) Throttle de ritmo: no máx. 1 entrada a cada 2 giros
+    # 4.1) Throttle de ritmo
     if state.spin_count - state.last_entry_spin < state.min_spins_between_entries:
         await safe_reply(update.message, format_response(state, {"status": "wait"}))
         return
@@ -228,12 +239,17 @@ async def handle_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # 6) Roda análise (adaptativa: normal vs conservadora)
     analysis = analyze(state)
 
-    # 7) Atualiza recomendação ativa SEM zerar placar
+    # 7) Atualiza recomendação ativa e ABRE aposta somente se houver recomendação
     if analysis.get("status") == "ok":
-        rec_text = analysis.get("recommendation", "")  # ex. "D1"
+        rec_text = analysis.get("recommendation", "")  # ex. "D2 + D3" (invertida)
         new_set: Set[str] = set(x.strip() for x in rec_text.split("+") if x.strip())
         state.set_recommendation(new_set)
         state.last_entry_spin = state.spin_count  # marca última entrada
+        state.has_open_rec = True                # abre aposta
+    else:
+        # sem recomendação: garante que não há aposta aberta
+        state.has_open_rec = False
+        state.current_rec = None
 
     # 8) Responde
     msg = format_response(state, analysis)
@@ -251,6 +267,7 @@ def start_health_server():
                 self.send_response(200)
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
+            # simples ping
                 self.wfile.write(b'{"status":"ok"}')
             else:
                 self.send_response(404)
