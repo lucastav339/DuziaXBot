@@ -6,6 +6,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackContext,
     filters,
 )
 
@@ -15,12 +16,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 🔹 Variáveis globais
 TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.environ.get("PORT", "10000"))
+if not TOKEN:
+    raise RuntimeError("Defina BOT_TOKEN no ambiente.")
 
-user_state = {}  # guarda placar e histórico por usuário
-
+# Estado por usuário
+user_state = {}  # user_id -> dict
 
 def get_user_state(user_id: int):
     if user_id not in user_state:
@@ -32,16 +33,10 @@ def get_user_state(user_id: int):
         }
     return user_state[user_id]
 
-
-# 🔹 Funções do bot
+# ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_state[user_id] = {
-        "jogadas": 0,
-        "acertos": 0,
-        "erros": 0,
-        "ultimo_palpite": None,
-    }
+    uid = update.effective_user.id
+    user_state[uid] = {"jogadas": 0, "acertos": 0, "erros": 0, "ultimo_palpite": None}
 
     keyboard = [["🔴 Vermelho", "⚫ Preto", "🟢 Zero"], ["/status", "/reset"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -53,13 +48,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
     )
 
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = get_user_state(update.effective_user.id)
-    jogadas = state["jogadas"]
-    acertos = state["acertos"]
-    erros = state["erros"]
-    taxa = (acertos / jogadas * 100) if jogadas > 0 else 0.0
+    st = get_user_state(update.effective_user.id)
+    jogadas, acertos, erros = st["jogadas"], st["acertos"], st["erros"]
+    taxa = (acertos / jogadas * 100.0) if jogadas > 0 else 0.0
 
     await update.message.reply_text(
         f"📊 Status atual:\n"
@@ -69,66 +61,60 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 Taxa de acerto: {taxa:.2f}%"
     )
 
-
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_state[user_id] = {
-        "jogadas": 0,
-        "acertos": 0,
-        "erros": 0,
-        "ultimo_palpite": None,
-    }
+    uid = update.effective_user.id
+    user_state[uid] = {"jogadas": 0, "acertos": 0, "erros": 0, "ultimo_palpite": None}
     await update.message.reply_text("♻️ Histórico e placar resetados!")
 
-
 async def handle_jogada(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = get_user_state(user_id)
-    jogada = update.message.text
+    uid = update.effective_user.id
+    st = get_user_state(uid)
+    jogada = update.message.text  # "🔴 Vermelho", "⚫ Preto", "🟢 Zero"
 
-    # Simulação: palpite anterior salvo
-    palpite = state["ultimo_palpite"]
-
-    # Comparar resultado atual com palpite
+    palpite = st["ultimo_palpite"]
     if palpite is not None:
-        state["jogadas"] += 1
+        st["jogadas"] += 1
         if jogada == palpite:
-            state["acertos"] += 1
+            st["acertos"] += 1
             resultado = "✅ Acerto!"
         else:
-            state["erros"] += 1
+            st["erros"] += 1
             resultado = "❌ Erro!"
     else:
         resultado = "⚡ Primeira jogada registrada (sem comparação)."
 
-    # Atualiza último palpite (aqui simplificado: sempre igual à jogada feita)
-    state["ultimo_palpite"] = jogada
+    # Exemplo simples: atualiza "palpite" como a própria jogada feita
+    st["ultimo_palpite"] = jogada
 
-    taxa = (state["acertos"] / state["jogadas"] * 100) if state["jogadas"] > 0 else 0.0
-
+    taxa = (st["acertos"] / st["jogadas"] * 100) if st["jogadas"] > 0 else 0.0
     await update.message.reply_text(
         f"{resultado}\n\n"
         f"📊 Placar:\n"
-        f"➡️ Jogadas: {state['jogadas']}\n"
-        f"✅ Acertos: {state['acertos']}\n"
-        f"❌ Erros: {state['erros']}\n"
+        f"➡️ Jogadas: {st['jogadas']}\n"
+        f"✅ Acertos: {st['acertos']}\n"
+        f"❌ Erros: {st['erros']}\n"
         f"📈 Taxa: {taxa:.2f}%"
     )
 
+# ---------- Startup hook: apaga webhook antes de pollar ----------
+async def on_startup(app):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook removido com sucesso (modo polling).")
+    except Exception as e:
+        logger.warning(f"Não consegui remover webhook: {e}")
 
-# 🔹 Execução
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(on_startup).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_jogada))
 
-    logger.info(f"🤖 Bot iniciado. Health check na porta {PORT}")
-
-    app.run_polling()
-
+    logger.info("🤖 Bot iniciado em polling.")
+    # drop_pending_updates=True evita processar fila pendente antiga
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
