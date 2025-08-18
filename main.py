@@ -7,7 +7,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 from telegram.error import Conflict
@@ -22,7 +21,8 @@ log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ex: https://duziaxbot.onrender.com
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")  # deixe vazio para barra raiz
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")  # se vazio, definimos um padrão seguro
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # recomendado no webhook
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
@@ -31,10 +31,6 @@ if not BOT_TOKEN:
 # =========================
 # Estado por usuário
 # =========================
-# Guardamos um placar simples:
-# - jogadas: quando há um palpite anterior e registramos novo resultado
-# - acertos/erros: compara jogada atual com "ultimo_palpite"
-# - ultimo_palpite: aqui, por simplicidade, passa a ser a própria jogada feita
 STATE: Dict[int, Dict[str, Any]] = {}
 
 
@@ -62,34 +58,39 @@ KB = ReplyKeyboardMarkup([CHOICES, ["/status", "/reset"]], resize_keyboard=True)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     STATE[uid] = {"jogadas": 0, "acertos": 0, "erros": 0, "ultimo_palpite": None}
-    await update.message.reply_text(
-        "🎲 Bem-vindo!\n"
-        "Use os botões para registrar as jogadas.\n"
-        "Comandos: /status /reset",
-        reply_markup=KB,
-    )
+    if update.message:
+        await update.message.reply_text(
+            "🎲 Bem-vindo!\n"
+            "Use os botões para registrar as jogadas.\n"
+            "Comandos: /status /reset",
+            reply_markup=KB,
+        )
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(update.effective_user.id)
     j, a, e = st["jogadas"], st["acertos"], st["erros"]
     taxa = (a / j * 100.0) if j > 0 else 0.0
-    await update.message.reply_text(
-        f"📊 Status\n"
-        f"➡️ Jogadas: {j}\n"
-        f"✅ Acertos: {a}\n"
-        f"❌ Erros: {e}\n"
-        f"📈 Taxa: {taxa:.2f}%"
-    )
+    if update.message:
+        await update.message.reply_text(
+            f"📊 Status\n"
+            f"➡️ Jogadas: {j}\n"
+            f"✅ Acertos: {a}\n"
+            f"❌ Erros: {e}\n"
+            f"📈 Taxa: {taxa:.2f}%"
+        )
 
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     STATE[uid] = {"jogadas": 0, "acertos": 0, "erros": 0, "ultimo_palpite": None}
-    await update.message.reply_text("♻️ Histórico e placar resetados!", reply_markup=KB)
+    if update.message:
+        await update.message.reply_text("♻️ Histórico e placar resetados!", reply_markup=KB)
 
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     uid = update.effective_user.id
     st = get_state(uid)
     jogada = update.message.text.strip()
@@ -127,10 +128,14 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Erros & Inicialização
+# Hooks & Inicialização
 # =========================
-async def on_startup(app):
-    # Se NÃO for webhook, garanta que não há webhook ativo (evita 409 no polling)
+async def _post_init(app):
+    """
+    Executa após a Application ser inicializada.
+    Se for rodar em POLLING, removemos qualquer webhook antigo para evitar 409/Conflict.
+    (Se WEBHOOK_URL estiver setado, o run_webhook vai setar o webhook depois.)
+    """
     if not WEBHOOK_URL:
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
@@ -144,7 +149,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -153,23 +158,31 @@ def main():
     app.add_error_handler(error_handler)
 
     if WEBHOOK_URL:
-        # WEBHOOK (serviço Web) — Render fornece PORT automaticamente
-        listen_port = PORT
-        path = WEBHOOK_PATH.strip("/")
-        webhook_full = WEBHOOK_URL.rstrip("/") + (f"/{path}" if path else "/")
-        log.info(f"🌐 Iniciando em WEBHOOK: {webhook_full} (porta {listen_port})")
+        # ── WEBHOOK (produção/Render) ─────────────────────────────────────
+        # Definimos um path seguro: se não vier do env, usa WEBHOOK_SECRET ou BOT_TOKEN
+        path = (WEBHOOK_PATH or WEBHOOK_SECRET or BOT_TOKEN).strip("/")
+        webhook_full = WEBHOOK_URL.rstrip("/") + f"/{path}"
+        log.info(f"🌐 Iniciando em WEBHOOK: {webhook_full} (porta {PORT})")
+
         app.run_webhook(
             listen="0.0.0.0",
-            port=listen_port,
-            url_path=path,
-            webhook_url=webhook_full,
+            port=PORT,
+            url_path=path,                 # rota interna do servidor embutido (aiohttp)
+            webhook_url=webhook_full,      # URL pública no Telegram
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=True,     # evita backlog antigo
+            allowed_updates=Update.ALL_TYPES,
         )
     else:
-        # POLLING (ideal para Worker; se usar Web sem WEBHOOK_URL, Render pode reclamar de porta)
+        # ── POLLING (local/worker único) ──────────────────────────────────
         log.info("🤖 Iniciando em POLLING.")
         try:
-            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+            app.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+            )
         except Conflict:
+            # Outro processo está chamando getUpdates com o MESMO token
             log.error("409 Conflict: outra instância está em polling. Encerre as duplicadas.")
             raise SystemExit(1)
 
