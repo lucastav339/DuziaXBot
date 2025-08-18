@@ -1,4 +1,8 @@
+# main.py — Webhook (Web) + placar de jogadas/acertos/erros
+# Requer: python-telegram-bot[webhooks]==21.6  (no requirements.txt)
+
 import os
+import sys
 import logging
 from typing import Dict, Any
 from telegram import Update, ReplyKeyboardMarkup
@@ -11,7 +15,7 @@ from telegram.ext import (
 )
 
 # =========================
-# Configuração & env
+# Config & ENV
 # =========================
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -26,7 +30,15 @@ PORT = int(os.getenv("PORT", "10000"))
 if not BOT_TOKEN:
     raise RuntimeError("Defina BOT_TOKEN no ambiente.")
 if not WEBHOOK_URL:
-    raise RuntimeError("Defina WEBHOOK_URL (você escolheu modo Webhook).")
+    raise RuntimeError("Defina WEBHOOK_URL (modo Webhook/Web escolhido).")
+
+# Log de versões pra diagnosticar incompatibilidades
+try:
+    import telegram
+    log.info(f"python-telegram-bot: {telegram.__version__}")
+except Exception:
+    log.info("python-telegram-bot: (não foi possível obter versão)")
+log.info(f"Python: {sys.version}")
 
 # =========================
 # Estado por usuário
@@ -118,7 +130,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     log.exception("Erro no handler:", exc_info=context.error)
 
 # =========================
-# Execução (Webhook)
+# Execução (Webhook/Web)
 # =========================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
