@@ -1,178 +1,99 @@
+# main.py
 import os
 import logging
-from typing import Dict, Any
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-)
-from telegram.error import Conflict
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# =========================
-# Configuração básica
-# =========================
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-log = logging.getLogger(__name__)
+# ───────────────────────
+# Config
+# ───────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("roulette-bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ex: https://duziaxbot.onrender.com
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")  # deixe vazio para barra raiz
-PORT = int(os.getenv("PORT", "10000"))
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # obrigatória
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
+# Defina WEBHOOK_URL = https://<seu-servico>.onrender.com/webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+
+if not WEBHOOK_URL:
+    # fallback (Render costuma expor essa env automaticamente)
+    base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if base:
+        WEBHOOK_URL = f"{base}/webhook"
+    else:
+        logger.warning("WEBHOOK_URL não definida. Defina nas variáveis de ambiente!")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Defina BOT_TOKEN no ambiente.")
+    raise RuntimeError("A variável de ambiente TELEGRAM_TOKEN não está definida.")
 
-# =========================
-# Estado por usuário
-# =========================
-# Guardamos um placar simples:
-# - jogadas: quando há um palpite anterior e registramos novo resultado
-# - acertos/erros: compara jogada atual com "ultimo_palpite"
-# - ultimo_palpite: aqui, por simplicidade, passa a ser a própria jogada feita
-STATE: Dict[int, Dict[str, Any]] = {}
+# ───────────────────────
+# FastAPI app
+# ───────────────────────
+app = FastAPI(title="Telegram Bot (Webhook)")
 
+# Constrói a Application do PTB uma única vez (sem polling!)
+application = Application.builder().token(BOT_TOKEN).build()
 
-def get_state(user_id: int) -> Dict[str, Any]:
-    if user_id not in STATE:
-        STATE[user_id] = {
-            "jogadas": 0,
-            "acertos": 0,
-            "erros": 0,
-            "ultimo_palpite": None,  # texto do último botão registrado
-        }
-    return STATE[user_id]
-
-
-# =========================
-# UI
-# =========================
-CHOICES = ["🔴 Vermelho", "⚫ Preto", "🟢 Zero"]
-KB = ReplyKeyboardMarkup([CHOICES, ["/status", "/reset"]], resize_keyboard=True)
-
-
-# =========================
-# Handlers
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    STATE[uid] = {"jogadas": 0, "acertos": 0, "erros": 0, "ultimo_palpite": None}
-    await update.message.reply_text(
-        "🎲 Bem-vindo!\n"
-        "Use os botões para registrar as jogadas.\n"
-        "Comandos: /status /reset",
-        reply_markup=KB,
+# ───────────────────────
+# Handlers do bot
+# ───────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_html(
+        "<b>Bot iniciado em modo Webhook</b> ✅\n"
+        "Sem polling, sem conflitos. Pode mandar comandos!"
     )
 
+# Registra handlers
+application.add_handler(CommandHandler("start", cmd_start))
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    st = get_state(update.effective_user.id)
-    j, a, e = st["jogadas"], st["acertos"], st["erros"]
-    taxa = (a / j * 100.0) if j > 0 else 0.0
-    await update.message.reply_text(
-        f"📊 Status\n"
-        f"➡️ Jogadas: {j}\n"
-        f"✅ Acertos: {a}\n"
-        f"❌ Erros: {e}\n"
-        f"📈 Taxa: {taxa:.2f}%"
+# ───────────────────────
+# Ciclo de vida do servidor
+# ───────────────────────
+@app.on_event("startup")
+async def on_startup() -> None:
+    logger.info("Inicializando PTB Application...")
+    # Inicializa e inicia a engine interna do PTB
+    await application.initialize()
+    await application.start()
+
+    # Define (ou redefine) o webhook do Telegram para este serviço
+    # drop_pending_updates=True evita processar backlog antigo
+    await application.bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
     )
+    logger.info(f"Webhook configurado em: {WEBHOOK_URL}")
 
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    logger.info("Parando PTB Application...")
+    await application.stop()
+    await application.shutdown()
+    logger.info("PTB finalizado.")
 
-async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    STATE[uid] = {"jogadas": 0, "acertos": 0, "erros": 0, "ultimo_palpite": None}
-    await update.message.reply_text("♻️ Histórico e placar resetados!", reply_markup=KB)
+# ───────────────────────
+# Rotas HTTP
+# ───────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
+@app.get("/")
+async def root():
+    return {"service": "Telegram Bot via Webhook", "ok": True}
 
-async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    st = get_state(uid)
-    jogada = update.message.text.strip()
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    # Valida o segredo enviado pelo Telegram (protege de chamadas externas)
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    if jogada not in CHOICES:
-        # Ignora textos aleatórios; reenvia teclado
-        await update.message.reply_text("Use os botões abaixo para registrar.", reply_markup=KB)
-        return
-
-    palpite = st["ultimo_palpite"]
-    if palpite is not None:
-        st["jogadas"] += 1
-        if jogada == palpite:
-            st["acertos"] += 1
-            resultado = "✅ Acerto!"
-        else:
-            st["erros"] += 1
-            resultado = "❌ Erro!"
-    else:
-        resultado = "⚡ Primeira jogada registrada (sem comparação)."
-
-    # Atualiza "palpite" (neste modelo simplificado, igual à jogada atual)
-    st["ultimo_palpite"] = jogada
-
-    taxa = (st["acertos"] / st["jogadas"] * 100.0) if st["jogadas"] > 0 else 0.0
-    await update.message.reply_text(
-        f"{resultado}\n\n"
-        f"📊 Placar:\n"
-        f"➡️ Jogadas: {st['jogadas']}\n"
-        f"✅ Acertos: {st['acertos']}\n"
-        f"❌ Erros: {st['erros']}\n"
-        f"📈 Taxa: {taxa:.2f}%",
-        reply_markup=KB,
-    )
-
-
-# =========================
-# Erros & Inicialização
-# =========================
-async def on_startup(app):
-    # Se NÃO for webhook, garanta que não há webhook ativo (evita 409 no polling)
-    if not WEBHOOK_URL:
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-            log.info("Webhook removido (modo polling).")
-        except Exception as e:
-            log.warning(f"Falha ao remover webhook: {e}")
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Erro no handler:", exc_info=context.error)
-
-
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("reset", reset_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
-    app.add_error_handler(error_handler)
-
-    if WEBHOOK_URL:
-        # WEBHOOK (serviço Web) — Render fornece PORT automaticamente
-        listen_port = PORT
-        path = WEBHOOK_PATH.strip("/")
-        webhook_full = WEBHOOK_URL.rstrip("/") + (f"/{path}" if path else "/")
-        log.info(f"🌐 Iniciando em WEBHOOK: {webhook_full} (porta {listen_port})")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=listen_port,
-            url_path=path,
-            webhook_url=webhook_full,
-        )
-    else:
-        # POLLING (ideal para Worker; se usar Web sem WEBHOOK_URL, Render pode reclamar de porta)
-        log.info("🤖 Iniciando em POLLING.")
-        try:
-            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-        except Conflict:
-            log.error("409 Conflict: outra instância está em polling. Encerre as duplicadas.")
-            raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()
+    data = await request.json()
+    # Converte payload em Update e entrega ao PTB (sem getUpdates!)
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return PlainTextResponse("OK")
