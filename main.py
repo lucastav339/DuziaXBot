@@ -1,5 +1,5 @@
 # main.py — Webhook PTB 21.6 + aiohttp (Render)
-# LÓGICA PREMIUM: Sinaliza a próxima COR só quando há evidência de viés (qui-quadrado).
+# LÓGICA PREMIUM (RÁPIDA): chi-quadrado 5% + gatilho "burst" (12→9+), cooldown curto.
 # UI PREMIUM: Mensagens formatadas, histórico em grade fixa de bolinhas (não “anda”).
 #
 # Requisitos:
@@ -53,13 +53,13 @@ log.info(f"Python: {sys.version}")
 log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 
 # =========================
-# Parâmetros da Estratégia
+# Parâmetros da Estratégia (versão mais rápida)
 # =========================
-WINDOW = int(os.getenv("WINDOW_SIZE", "10"))          # tamanho da janela estatística (R/B) — zeros são ignorados
-ALPHA = 0.01                                          # nível de significância
-CHI2_CRIT_DF1 = 6.635                                 # crítico 1% df=1
-GAP_MIN = int(os.getenv("GAP_MIN", "5"))              # diferença mínima V - P
-COOLDOWN_AFTER_EVAL = int(os.getenv("COOLDOWN", "5")) # giros após avaliar um sinal
+WINDOW = int(os.getenv("WINDOW_SIZE", "30"))          # janela menor → reage mais rápido
+ALPHA = 0.05                                          # 5%
+CHI2_CRIT_DF1 = 3.841                                 # crítico 5% df=1
+GAP_MIN = int(os.getenv("GAP_MIN", "3"))              # gap mínimo menor
+COOLDOWN_AFTER_EVAL = int(os.getenv("COOLDOWN", "3")) # cooldown mais curto
 
 # ======= Visual do histórico em grade fixa =======
 HISTORY_COLS = 30          # qtde de bolinhas por linha (fixo)
@@ -149,28 +149,49 @@ def pretty_status(st: Dict[str, Any]) -> str:
     )
 
 # =========================
-# Estatística da janela
+# Lógica de decisão (rápida)
 # =========================
+def fast_burst_trigger(history: List[str]) -> Optional[str]:
+    """
+    Gatilho rápido por 'burst' recente:
+    - Olha as últimas 12 observações R/B (zeros ignorados).
+    - Se houver >= 9 do mesmo lado → sinaliza esse lado.
+    """
+    rb = [h for h in history if h in ("R", "B")]
+    if len(rb) < 12:
+        return None
+    last = rb[-12:]
+    r = last.count("R")
+    b = 12 - r
+    m = max(r, b)
+    if m < 9:
+        return None
+    return "R" if r > b else "B"
+
 def decide_signal(history: List[str]) -> Optional[str]:
     """
-    Retorna 'R' ou 'B' quando há evidência de viés forte; None caso contrário.
-    - Usa only R/B (ignora Z) para teste chi-quadrado df=1.
-    - Requer gap mínimo e valor de qui-quadrado acima do crítico em 1%.
+    Retorna 'R' ou 'B' quando há evidência de viés.
+    Camada A (rápida): burst recente 12→9+ (fast_burst_trigger).
+    Camada B (janela estatística): χ² 5% + GAP_MIN em janela WINDOW.
     """
+    # Camada A: burst recente
+    burst = fast_burst_trigger(history)
+    if burst is not None:
+        return burst
+
+    # Camada B: chi-quadrado em janela
     window = history[-WINDOW:] if len(history) > WINDOW else history[:]
     rb = [h for h in window if h in ("R", "B")]
     n = len(rb)
-    if n < 20:  # amostra mínima razoável
+    if n < 14:  # amostra mínima um pouco menor
         return None
 
     r = rb.count("R")
     b = n - r
-    exp = n / 2.0  # expectativa sob H0 (50/50, ignorando zeros)
-    chi2 = 0.0
-    if exp > 0:
-        chi2 = ((r - exp) ** 2) / exp + ((b - exp) ** 2) / exp
-
+    exp = n / 2.0
+    chi2 = 0.0 if exp == 0 else ((r - exp) ** 2) / exp + ((b - exp) ** 2) / exp
     gap = abs(r - b)
+
     if chi2 >= CHI2_CRIT_DF1 and gap >= GAP_MIN:
         return "R" if r > b else "B"
     return None
@@ -195,13 +216,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def estrategia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
-        "📚 <b>Metodologia Premium (resumo)</b>\n"
-        f"• Janela deslizante das últimas <b>{WINDOW}</b> jogadas (R/B; zeros ignorados).\n"
-        "• Teste <b>Qui-Quadrado</b> (df=1, α=1%) em <b>Vermelho vs Preto</b>.\n"
-        f"• Sinal apenas se <b>χ² ≥ {CHI2_CRIT_DF1}</b> e <b>gap ≥ {GAP_MIN}</b>.\n"
-        f"• Após avaliar um sinal, aguarda <b>{COOLDOWN_AFTER_EVAL}</b> giros (cooldown).\n"
+        "📚 <b>Metodologia Premium (rápida)</b>\n"
+        f"• Burst recente: últimas <b>12</b> (ignora 0); se ≥<b>9</b> do mesmo lado → sinal.\n"
+        f"• Janela estatística: últimas <b>{WINDOW}</b> (R/B), χ² 5% (≥ <b>{CHI2_CRIT_DF1}</b>) + gap ≥ <b>{GAP_MIN}</b>.\n"
+        f"• Cooldown após avaliar: <b>{COOLDOWN_AFTER_EVAL}</b> giros.\n"
         "• Zero (0) é registrado, mas não entra no teste de cor.\n\n"
-        "💡 Filosofia: Sem vantagem detectada → sem entrada (-EV).",
+        "💡 Filosofia: acelerar entradas sem virar kamikaze.",
         reply_markup=KB,
     )
 
@@ -280,13 +300,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 4) Se não há cooldown, tenta decidir um novo sinal
+    # 4) Se não há cooldown, tenta decidir um novo sinal (rápido)
     signal = decide_signal(st["history"])
 
     if signal is None:
-        # Sem evidência forte
+        # Sem evidência suficiente
         await update.message.reply_html(
-            "{}\n\n🧪 <b>Sem vantagem estatística.</b> Continuando a coleta…\n"
+            "{}\n\n🧪 <b>Sem vantagem estatística suficiente.</b> Continuando a coleta…\n"
             "🧩 <b>Histórico (grade fixa):</b>\n"
             f"{hist_grid}\n\n"
             f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
@@ -297,10 +317,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 5) Emite sinal (a ser avaliado no próximo giro)
     st["pending_signal"] = signal
     cor_txt = "🔴 Vermelho" if signal == "R" else "⚫ Preto"
+    reason = "viés recente (burst 12→9+)" if fast_burst_trigger(st['history']) else f"χ² ≥ {CHI2_CRIT_DF1} e gap ≥ {GAP_MIN}"
     await update.message.reply_html(
         "{}\n\n🎯 <b>Recomendação Premium</b>\n"
         f"• Apostar em: <b>{cor_txt}</b>\n"
-        f"• Motivo: <i>viés de cor detectado</i> (χ² ≥ {CHI2_CRIT_DF1} e gap ≥ {GAP_MIN}).\n\n"
+        f"• Motivo: <i>{reason}</i>.\n\n"
         "🧩 <b>Histórico (grade fixa):</b>\n"
         f"{hist_grid}\n\n"
         f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
