@@ -1,6 +1,9 @@
 # main.py — Webhook PTB 21.6 + aiohttp (Render)
-# LÓGICA PREMIUM (RÁPIDA): chi-quadrado 5% + gatilho "burst" (12→9+), cooldown curto.
-# UI PREMIUM: Mensagens formatadas, histórico em grade fixa de bolinhas (não “anda”).
+# MODOS:
+#  • Premium estatístico (padrão): chi-quadrado + burst
+#  • Tendência curta (/tendencia): 2 seguidas repete; 4+ inverte; com Gale 1x
+#
+# UI: Histórico em grade fixa de bolinhas (não “anda”).
 #
 # Requisitos:
 #   python-telegram-bot==21.6
@@ -12,7 +15,6 @@
 import os
 import sys
 import json
-import math
 import asyncio
 import logging
 import signal
@@ -53,26 +55,28 @@ log.info(f"Python: {sys.version}")
 log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 
 # =========================
-# Parâmetros da Estratégia (versão mais rápida)
+# Parâmetros — Modo Premium (rápido)
 # =========================
-WINDOW = int(os.getenv("WINDOW_SIZE", "30"))          # janela menor → reage mais rápido
-ALPHA = 0.05                                          # 5%
-CHI2_CRIT_DF1 = 3.841                                 # crítico 5% df=1
-GAP_MIN = int(os.getenv("GAP_MIN", "3"))              # gap mínimo menor
-COOLDOWN_AFTER_EVAL = int(os.getenv("COOLDOWN", "3")) # cooldown mais curto
+WINDOW = int(os.getenv("WINDOW_SIZE", "30"))          # janela p/ chi-quadrado
+CHI2_CRIT_DF1 = 3.841                                 # 5% df=1
+GAP_MIN = int(os.getenv("GAP_MIN", "3"))              # gap mínimo
+COOLDOWN_AFTER_EVAL = int(os.getenv("COOLDOWN", "3")) # cooldown curto
 
 # ======= Visual do histórico em grade fixa =======
-HISTORY_COLS = 30          # qtde de bolinhas por linha (fixo)
-MAX_HISTORY_ROWS = 8       # mostra no máx. as últimas N linhas no /status e mensagens
-HISTORY_PLACEHOLDER = "◻️" # marcador para posições vazias na última linha
+HISTORY_COLS = 30
+MAX_HISTORY_ROWS = 8
+HISTORY_PLACEHOLDER = "◻️"
 
 # =========================
 # Estado por usuário
 # =========================
+# Campos:
 # - jogadas, acertos, erros
-# - history: List[str] com valores em {"R","B","Z"} — ilimitado
-# - pending_signal: Optional[str] em {"R","B"} aguardando avaliação no próximo giro
-# - cooldown_left: int (giros a aguardar antes de novo sinal)
+# - history: List[str] com {"R","B","Z"} — ilimitado
+# - mode: "premium" | "tendencia"
+# - pending_signal: Optional["R"|"B"]
+# - pending_stage: None | "base" | "gale"   (apenas no modo tendencia)
+# - cooldown_left: int (usado no premium)
 STATE: Dict[int, Dict[str, Any]] = {}
 
 def get_state(user_id: int) -> Dict[str, Any]:
@@ -81,9 +85,11 @@ def get_state(user_id: int) -> Dict[str, Any]:
             "jogadas": 0,
             "acertos": 0,
             "erros": 0,
-            "history": [],              # sequência compacta: R/B/Z
-            "pending_signal": None,     # cor sinalizada a ser avaliada no próximo giro
-            "cooldown_left": 0,         # aguarda X giros após avaliação
+            "history": [],
+            "mode": "premium",
+            "pending_signal": None,
+            "pending_stage": None,
+            "cooldown_left": 0,
         }
     return STATE[user_id]
 
@@ -91,39 +97,24 @@ def get_state(user_id: int) -> Dict[str, Any]:
 # UI (teclado e helpers)
 # =========================
 CHOICES = ["🔴 Vermelho", "⚫ Preto", "🟢 Zero"]
-KB = ReplyKeyboardMarkup([CHOICES, ["/status", "/reset", "/estrategia"]], resize_keyboard=True)
+# Substitui /status por /tendencia no teclado
+KB = ReplyKeyboardMarkup([CHOICES, ["/tendencia", "/reset", "/estrategia"]], resize_keyboard=True)
 
 def as_symbol(c: str) -> str:
     return "🔴" if c == "R" else ("⚫" if c == "B" else "🟢")
 
 def render_history_grid(history: List[str]) -> str:
-    """
-    Renderiza o histórico como uma grade fixa de bolinhas:
-    - Largura constante por linha (HISTORY_COLS)
-    - Linhas preenchidas da esquerda p/ direita
-    - A última linha é preenchida com placeholders para não “andar”
-    - Mostra no máx. MAX_HISTORY_ROWS linhas (as mais recentes)
-    """
     syms = [as_symbol(c) for c in history]
-
-    # quebra em linhas de largura fixa
     rows: List[List[str]] = []
     for i in range(0, len(syms), HISTORY_COLS):
         rows.append(syms[i:i + HISTORY_COLS])
-
     if not rows:
         return HISTORY_PLACEHOLDER * HISTORY_COLS
-
-    # completa a última linha com placeholders se incompleta
     last = rows[-1]
     if len(last) < HISTORY_COLS:
         last = last + [HISTORY_PLACEHOLDER] * (HISTORY_COLS - len(last))
         rows[-1] = last
-
-    # limita as linhas exibidas (as mais recentes)
     rows_to_show = rows[-MAX_HISTORY_ROWS:]
-
-    # monta string final (com rótulo opcional Lxx:)
     rendered_lines: List[str] = []
     total_rows = len(rows)
     start_row_index = total_rows - len(rows_to_show) + 1
@@ -136,64 +127,97 @@ def pretty_status(st: Dict[str, Any]) -> str:
     j, a, e = st["jogadas"], st["acertos"], st["erros"]
     taxa = (a / j * 100.0) if j > 0 else 0.0
     pend = st["pending_signal"]
+    pend_stage = st.get("pending_stage")
     cool = st["cooldown_left"]
     label_pend = "—" if pend is None else ("🔴" if pend=="R" else "⚫")
+    stage = "—"
+    if pend_stage in ("base","gale"):
+        stage = "BASE" if pend_stage=="base" else "GALE"
     return (
         "🏷️ <b>Status</b>\n"
         f"• 🎯 <b>Jogadas:</b> {j}\n"
         f"• ✅ <b>Acertos:</b> {a}\n"
         f"• ❌ <b>Erros:</b> {e}\n"
         f"• 📈 <b>Taxa:</b> {taxa:.2f}%\n"
-        f"• ⏱️ <b>Cooldown:</b> {cool}\n"
-        f"• 🧠 <b>Sinal pendente:</b> {label_pend}"
+        f"• 🧭 <b>Modo:</b> {st['mode']}\n"
+        f"• 🧠 <b>Sinal pendente:</b> {label_pend} ({stage})\n"
+        f"• ⏱️ <b>Cooldown:</b> {cool}"
     )
 
 # =========================
-# Lógica de decisão (rápida)
+# Lógica — Premium (burst + chi-quadrado)
 # =========================
 def fast_burst_trigger(history: List[str]) -> Optional[str]:
-    """
-    Gatilho rápido por 'burst' recente:
-    - Olha as últimas 12 observações R/B (zeros ignorados).
-    - Se houver >= 9 do mesmo lado → sinaliza esse lado.
-    """
-    rb = [h for h in history if h in ("R", "B")]
+    rb = [h for h in history if h in ("R","B")]
     if len(rb) < 12:
         return None
     last = rb[-12:]
     r = last.count("R")
     b = 12 - r
-    m = max(r, b)
-    if m < 9:
-        return None
-    return "R" if r > b else "B"
+    if max(r,b) >= 9:
+        return "R" if r > b else "B"
+    return None
 
-def decide_signal(history: List[str]) -> Optional[str]:
-    """
-    Retorna 'R' ou 'B' quando há evidência de viés.
-    Camada A (rápida): burst recente 12→9+ (fast_burst_trigger).
-    Camada B (janela estatística): χ² 5% + GAP_MIN em janela WINDOW.
-    """
-    # Camada A: burst recente
+def decide_signal_premium(history: List[str]) -> Optional[str]:
     burst = fast_burst_trigger(history)
     if burst is not None:
         return burst
-
-    # Camada B: chi-quadrado em janela
     window = history[-WINDOW:] if len(history) > WINDOW else history[:]
-    rb = [h for h in window if h in ("R", "B")]
+    rb = [h for h in window if h in ("R","B")]
     n = len(rb)
-    if n < 14:  # amostra mínima um pouco menor
+    if n < 14:
         return None
-
     r = rb.count("R")
     b = n - r
-    exp = n / 2.0
-    chi2 = 0.0 if exp == 0 else ((r - exp) ** 2) / exp + ((b - exp) ** 2) / exp
-    gap = abs(r - b)
-
+    exp = n/2.0
+    chi2 = 0.0 if exp==0 else ((r-exp)**2)/exp + ((b-exp)**2)/exp
+    gap = abs(r-b)
     if chi2 >= CHI2_CRIT_DF1 and gap >= GAP_MIN:
-        return "R" if r > b else "B"
+        return "R" if r>b else "B"
+    return None
+
+# =========================
+# Lógica — Tendência curta + Gale 1x
+# =========================
+def last_streak_color(history: List[str]) -> Optional[str]:
+    """
+    Retorna ('R'|'B', tamanho_da_streak) considerando que 'Z' quebra a sequência.
+    Ignora rótulos fora de R/B/Z.
+    """
+    # percorre do fim até encontrar primeira R/B
+    i = len(history) - 1
+    while i >= 0 and history[i] not in ("R","B"):
+        # Z ou outra marca quebra a sequência
+        i -= 1
+        # se for zero logo no final, não existe sequência contínua R/B
+        if i < 0:
+            return None
+        if history[i] not in ("R","B"):
+            return None
+    if i < 0:
+        return None
+    color = history[i]
+    streak = 1
+    j = i - 1
+    while j >= 0 and history[j] == color:
+        streak += 1
+        j -= 1
+    return (color, streak)
+
+def decide_signal_trend(history: List[str]) -> Optional[str]:
+    """
+    Regras:
+      • 2 seguidas → apostar que repete (mesma cor).
+      • 4+ seguidas → apostar na cor oposta.
+    """
+    res = last_streak_color(history)
+    if not res:
+        return None
+    color, streak = res
+    if streak >= 4:
+        return "B" if color == "R" else "R"
+    if streak >= 2:
+        return color
     return None
 
 # =========================
@@ -203,39 +227,64 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     STATE[uid] = {
         "jogadas": 0, "acertos": 0, "erros": 0,
-        "history": [], "pending_signal": None, "cooldown_left": 0
+        "history": [], "mode": "premium",
+        "pending_signal": None, "pending_stage": None,
+        "cooldown_left": 0
     }
     await update.message.reply_html(
         "🤖 <b>iDozen Premium — Análise de Cores</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Envie o <b>resultado</b> usando os botões abaixo.\n"
-        "O bot só recomenda se houver <b>vantagem estatística</b>.\n\n"
-        "Comandos: <b>/status</b> • <b>/reset</b> • <b>/estrategia</b>",
+        "Modos: <b>premium</b> (estatística) ou <b>tendencia</b> (curta com Gale 1x via /tendencia).\n\n"
+        "Comandos: <b>/tendencia</b> • <b>/reset</b> • <b>/estrategia</b>",
         reply_markup=KB,
     )
 
 async def estrategia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(
-        "📚 <b>Metodologia Premium (rápida)</b>\n"
-        f"• Burst recente: últimas <b>12</b> (ignora 0); se ≥<b>9</b> do mesmo lado → sinal.\n"
-        f"• Janela estatística: últimas <b>{WINDOW}</b> (R/B), χ² 5% (≥ <b>{CHI2_CRIT_DF1}</b>) + gap ≥ <b>{GAP_MIN}</b>.\n"
-        f"• Cooldown após avaliar: <b>{COOLDOWN_AFTER_EVAL}</b> giros.\n"
-        "• Zero (0) é registrado, mas não entra no teste de cor.\n\n"
-        "💡 Filosofia: acelerar entradas sem virar kamikaze.",
-        reply_markup=KB,
-    )
+    st = get_state(update.effective_user.id)
+    if st["mode"] == "tendencia":
+        await update.message.reply_html(
+            "🧭 <b>Modo: Tendência Curta</b>\n"
+            "• Se uma cor saiu <b>2x seguidas</b>, apostar que <b>repete</b>.\n"
+            "• Se saiu <b>4x seguidas</b> ou mais, apostar na <b>oposta</b>.\n"
+            "• <b>Gale 1x</b>: se errar a base, repete a aposta 1x; se acertar no gale, conta <b>acerto</b> e <b>não</b> conta erro.\n"
+            "• Zeros (🟢) quebram a sequência.\n",
+            reply_markup=KB,
+        )
+    else:
+        await update.message.reply_html(
+            "📚 <b>Modo: Premium (rápido)</b>\n"
+            f"• Burst: últimas 12 (ignora 🟢); se ≥9 da mesma cor → sinal.\n"
+            f"• Janela: últimas {WINDOW} (R/B), χ² ≥ {CHI2_CRIT_DF1} + gap ≥ {GAP_MIN}.\n"
+            f"• Cooldown: {COOLDOWN_AFTER_EVAL} giros após avaliar.\n"
+            "• Zero (🟢) não entra no teste de cor, mas é registrado.\n",
+            reply_markup=KB,
+        )
+
+async def toggle_tendencia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st = get_state(update.effective_user.id)
+    if st["mode"] == "tendencia":
+        st["mode"] = "premium"
+        st["pending_signal"] = None
+        st["pending_stage"] = None
+        await update.message.reply_html(
+            "🧭 Modo alterado para <b>premium</b> (estatística).", reply_markup=KB
+        )
+    else:
+        st["mode"] = "tendencia"
+        st["pending_signal"] = None
+        st["pending_stage"] = None
+        await update.message.reply_html(
+            "🧭 Modo alterado para <b>tendência curta</b> (com Gale 1x).", reply_markup=KB
+        )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Continua disponível (não está no teclado, mas o comando existe)
     st = get_state(update.effective_user.id)
-    j, a, e = st["jogadas"], st["acertos"], st["erros"]
-    taxa = (a / j * 100.0) if j > 0 else 0.0
     hist_grid = render_history_grid(st["history"])
     await update.message.reply_html(
-        "📊 <b>Status Premium</b>\n"
-        f"• 🎯 <b>Jogadas:</b> {j}\n"
-        f"• ✅ <b>Acertos:</b> {a}\n"
-        f"• ❌ <b>Erros:</b> {e}\n"
-        f"• 📈 <b>Taxa:</b> {taxa:.2f}%\n\n"
+        "📊 <b>Status</b>\n"
+        f"{pretty_status(st)}\n\n"
         "🧩 <b>Histórico (grade fixa):</b>\n"
         f"{hist_grid}",
         reply_markup=KB,
@@ -245,9 +294,72 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     STATE[uid] = {
         "jogadas": 0, "acertos": 0, "erros": 0,
-        "history": [], "pending_signal": None, "cooldown_left": 0
+        "history": [], "mode": "premium",
+        "pending_signal": None, "pending_stage": None,
+        "cooldown_left": 0
     }
     await update.message.reply_html("♻️ <b>Histórico e placar resetados.</b>", reply_markup=KB)
+
+# --------- Avaliação de sinais (com/sem gale) ----------
+def evaluate_premium_on_spin(st: Dict[str, Any], obs: str) -> str:
+    """Avalia pendência no modo premium (sem gale)."""
+    outcome_msg = ""
+    if st["pending_signal"] in ("R","B"):
+        if obs == st["pending_signal"]:
+            st["jogadas"] += 1
+            st["acertos"] += 1
+            outcome_msg = "🏆 <b>Resultado:</b> ✅ Acerto no sinal anterior."
+        elif obs in ("R","B"):
+            st["jogadas"] += 1
+            st["erros"] += 1
+            outcome_msg = "🏆 <b>Resultado:</b> ❌ Erro no sinal anterior."
+        else:
+            outcome_msg = "🏆 <b>Resultado:</b> 🟢 Zero — sinal não contabilizado."
+        st["pending_signal"] = None
+        st["cooldown_left"] = COOLDOWN_AFTER_EVAL
+    return outcome_msg
+
+def evaluate_trend_on_spin(st: Dict[str, Any], obs: str) -> str:
+    """
+    Avalia pendência no modo tendência com Gale 1x:
+    - Se base erra e obs é R/B → não conta ainda; entra 'gale'
+    - Se gale acerta → conta 1 acerto e não conta erro
+    - Se gale erra → conta 1 erro
+    - Zero não avalia; mantém pendência
+    """
+    msg = ""
+    sig = st["pending_signal"]
+    stage = st["pending_stage"]
+    if sig not in ("R","B"):
+        return msg
+
+    if obs == "Z":
+        return "🏆 <b>Resultado:</b> 🟢 Zero — aguardando avaliação."
+
+    if stage == "base":
+        if obs == sig:
+            st["jogadas"] += 1
+            st["acertos"] += 1
+            msg = "🏆 <b>Resultado:</b> ✅ Acerto na BASE."
+            st["pending_signal"] = None
+            st["pending_stage"] = None
+        else:
+            # errou base → entra Gale 1x (sem contar erro agora)
+            st["pending_stage"] = "gale"
+            msg = "🔁 <b>Gale 1x:</b> repetir a mesma cor no próximo giro."
+    elif stage == "gale":
+        st["jogadas"] += 1
+        if obs == sig:
+            # acerto no gale → conta ACERTO e NÃO conta o erro da base
+            st["acertos"] += 1
+            msg = "🏆 <b>Resultado:</b> ✅ Acerto no GALE (sem erro contabilizado)."
+        else:
+            st["erros"] += 1
+            msg = "🏆 <b>Resultado:</b> ❌ Erro no GALE."
+        st["pending_signal"] = None
+        st["pending_stage"] = None
+
+    return msg
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -266,65 +378,57 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         obs = "Z"
 
-    # 1) Atualiza histórico (ilimitado; não cortar)
+    # 1) Atualiza histórico (ilimitado)
     st["history"].append(obs)
 
-    # 2) Se havia sinal pendente, avalia neste giro
-    outcome_msg = ""
-    if st["pending_signal"] in ("R", "B"):
-        st["jogadas"] += 1
-        if obs == st["pending_signal"]:
-            st["acertos"] += 1
-            outcome_msg = "🏆 <b>Resultado:</b> ✅ Acerto no sinal anterior."
-        elif obs in ("R", "B"):
-            st["erros"] += 1
-            outcome_msg = "🏆 <b>Resultado:</b> ❌ Erro no sinal anterior."
-        else:
-            outcome_msg = "🏆 <b>Resultado:</b> 🟢 Zero — sinal não contabilizado."
-
-        # aplica cooldown e limpa pendência
-        st["pending_signal"] = None
-        st["cooldown_left"] = COOLDOWN_AFTER_EVAL
-
+    # 2) Avaliação de pendências conforme modo
     hist_grid = render_history_grid(st["history"])
+    outcome_msg = ""
 
-    # 3) Se cooldown > 0, apenas consome uma unidade
-    if st["cooldown_left"] > 0:
-        st["cooldown_left"] -= 1
-        await update.message.reply_html(
-            "{}\n\n⏳ <b>Coletando dados (cooldown).</b>\n"
-            "🧩 <b>Histórico (grade fixa):</b>\n"
-            f"{hist_grid}\n\n"
-            f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
-            reply_markup=KB,
-        )
-        return
+    if st["mode"] == "tendencia":
+        outcome_msg = evaluate_trend_on_spin(st, obs)
+        # no modo tendência, sem cooldown
+    else:
+        # premium
+        if st["cooldown_left"] > 0:
+            st["cooldown_left"] -= 1
+        outcome_msg = evaluate_premium_on_spin(st, obs)
 
-    # 4) Se não há cooldown, tenta decidir um novo sinal (rápido)
-    signal = decide_signal(st["history"])
+    # 3) Se ainda não há pendência ativa (ou ela foi concluída), tentar novo sinal
+    recommend_msg = ""
+    if st["pending_signal"] is None and obs in ("R","B"):  # só decide após registrar algo útil
+        if st["mode"] == "tendencia":
+            sig = decide_signal_trend(st["history"])
+            if sig:
+                st["pending_signal"] = sig
+                st["pending_stage"] = "base"
+                cor_txt = "🔴 Vermelho" if sig == "R" else "⚫ Preto"
+                recommend_msg = (
+                    "🎯 <b>Sinal — Tendência Curta</b>\n"
+                    f"• Apostar em: <b>{cor_txt}</b>\n"
+                    "• Regras: 2 seguidas repete; 4+ inverte.\n"
+                    "• <b>Gale 1x</b> habilitado (se base errar).\n"
+                    "👉 Envie o próximo resultado para avaliar."
+                )
+        else:
+            # premium: só se cooldown zerado
+            if st["cooldown_left"] <= 0:
+                sig = decide_signal_premium(st["history"])
+                if sig:
+                    st["pending_signal"] = sig
+                    cor_txt = "🔴 Vermelho" if sig == "R" else "⚫ Preto"
+                    recommend_msg = (
+                        "🎯 <b>Recomendação Premium</b>\n"
+                        f"• Apostar em: <b>{cor_txt}</b>\n"
+                        f"• Motivo: <i>viés recente (burst) ou χ² ≥ {CHI2_CRIT_DF1} + gap ≥ {GAP_MIN}</i>.\n"
+                        "👉 Envie o próximo resultado para avaliar."
+                    )
 
-    if signal is None:
-        # Sem evidência suficiente
-        await update.message.reply_html(
-            "{}\n\n🧪 <b>Sem vantagem estatística suficiente.</b> Continuando a coleta…\n"
-            "🧩 <b>Histórico (grade fixa):</b>\n"
-            f"{hist_grid}\n\n"
-            f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
-            reply_markup=KB,
-        )
-        return
-
-    # 5) Emite sinal (a ser avaliado no próximo giro)
-    st["pending_signal"] = signal
-    cor_txt = "🔴 Vermelho" if signal == "R" else "⚫ Preto"
-    reason = "viés recente (burst 12→9+)" if fast_burst_trigger(st['history']) else f"χ² ≥ {CHI2_CRIT_DF1} e gap ≥ {GAP_MIN}"
+    # 4) Resposta consolidada
+    base_msg = outcome_msg or "📥 Resultado registrado."
+    extra = recommend_msg if recommend_msg else "🧩 <b>Histórico (grade fixa):</b>\n" + hist_grid
     await update.message.reply_html(
-        "{}\n\n🎯 <b>Recomendação Premium</b>\n"
-        f"• Apostar em: <b>{cor_txt}</b>\n"
-        f"• Motivo: <i>{reason}</i>.\n\n"
-        "🧩 <b>Histórico (grade fixa):</b>\n"
-        f"{hist_grid}\n\n"
-        f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
+        f"{base_msg}\n\n{extra}\n\n{pretty_status(st)}",
         reply_markup=KB,
     )
 
@@ -368,7 +472,8 @@ def build_web_app(tg_app: Application) -> web.Application:
 async def amain():
     tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("status", status_cmd))
+    tg_app.add_handler(CommandHandler("tendencia", toggle_tendencia))  # << novo comando
+    tg_app.add_handler(CommandHandler("status", status_cmd))           # ainda existe como comando opcional
     tg_app.add_handler(CommandHandler("reset", reset_cmd))
     tg_app.add_handler(CommandHandler("estrategia", estrategia))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice))
