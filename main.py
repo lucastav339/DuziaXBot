@@ -55,7 +55,7 @@ log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 # =========================
 # Parâmetros da Estratégia
 # =========================
-WINDOW = int(os.getenv("WINDOW_SIZE", "60"))          # tamanho da janela estatística (R/B) — zeros são ignorados
+WINDOW = int(os.getenv("WINDOW_SIZE", "10"))          # tamanho da janela estatística (R/B) — zeros são ignorados
 ALPHA = 0.01                                          # nível de significância
 CHI2_CRIT_DF1 = 6.635                                 # crítico 1% df=1
 GAP_MIN = int(os.getenv("GAP_MIN", "5"))              # diferença mínima V - P
