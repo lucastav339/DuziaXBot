@@ -1,6 +1,6 @@
 # main.py — Webhook PTB 21.6 + aiohttp (Render)
 # LÓGICA PREMIUM: Sinaliza a próxima COR só quando há evidência de viés (qui-quadrado).
-# UI PREMIUM: Mensagens formatadas, status claro, cooldown após avaliar um sinal.
+# UI PREMIUM: Mensagens formatadas, histórico em grade fixa de bolinhas (não “anda”).
 #
 # Requisitos:
 #   python-telegram-bot==21.6
@@ -55,18 +55,22 @@ log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 # =========================
 # Parâmetros da Estratégia
 # =========================
-WINDOW = int(os.getenv("WINDOW_SIZE", "60"))          # tamanho da janela
+WINDOW = int(os.getenv("WINDOW_SIZE", "60"))          # tamanho da janela estatística (R/B) — zeros são ignorados
 ALPHA = 0.01                                          # nível de significância
 CHI2_CRIT_DF1 = 6.635                                 # crítico 1% df=1
 GAP_MIN = int(os.getenv("GAP_MIN", "5"))              # diferença mínima V - P
 COOLDOWN_AFTER_EVAL = int(os.getenv("COOLDOWN", "5")) # giros após avaliar um sinal
 
+# ======= Visual do histórico em grade fixa =======
+HISTORY_COLS = 30          # qtde de bolinhas por linha (fixo)
+MAX_HISTORY_ROWS = 8       # mostra no máx. as últimas N linhas no /status e mensagens
+HISTORY_PLACEHOLDER = "◻️" # marcador para posições vazias na última linha
+
 # =========================
 # Estado por usuário
 # =========================
-# Campos:
 # - jogadas, acertos, erros
-# - history: List[str] com valores em {"R","B","Z"}
+# - history: List[str] com valores em {"R","B","Z"} — ilimitado
 # - pending_signal: Optional[str] em {"R","B"} aguardando avaliação no próximo giro
 # - cooldown_left: int (giros a aguardar antes de novo sinal)
 STATE: Dict[int, Dict[str, Any]] = {}
@@ -89,6 +93,45 @@ def get_state(user_id: int) -> Dict[str, Any]:
 CHOICES = ["🔴 Vermelho", "⚫ Preto", "🟢 Zero"]
 KB = ReplyKeyboardMarkup([CHOICES, ["/status", "/reset", "/estrategia"]], resize_keyboard=True)
 
+def as_symbol(c: str) -> str:
+    return "🔴" if c == "R" else ("⚫" if c == "B" else "🟢")
+
+def render_history_grid(history: List[str]) -> str:
+    """
+    Renderiza o histórico como uma grade fixa de bolinhas:
+    - Largura constante por linha (HISTORY_COLS)
+    - Linhas preenchidas da esquerda p/ direita
+    - A última linha é preenchida com placeholders para não “andar”
+    - Mostra no máx. MAX_HISTORY_ROWS linhas (as mais recentes)
+    """
+    syms = [as_symbol(c) for c in history]
+
+    # quebra em linhas de largura fixa
+    rows: List[List[str]] = []
+    for i in range(0, len(syms), HISTORY_COLS):
+        rows.append(syms[i:i + HISTORY_COLS])
+
+    if not rows:
+        return HISTORY_PLACEHOLDER * HISTORY_COLS
+
+    # completa a última linha com placeholders se incompleta
+    last = rows[-1]
+    if len(last) < HISTORY_COLS:
+        last = last + [HISTORY_PLACEHOLDER] * (HISTORY_COLS - len(last))
+        rows[-1] = last
+
+    # limita as linhas exibidas (as mais recentes)
+    rows_to_show = rows[-MAX_HISTORY_ROWS:]
+
+    # monta string final (com rótulo opcional Lxx:)
+    rendered_lines: List[str] = []
+    total_rows = len(rows)
+    start_row_index = total_rows - len(rows_to_show) + 1
+    for idx, row in enumerate(rows_to_show, start=start_row_index):
+        prefix = f"L{idx:02d}: "
+        rendered_lines.append(prefix + "".join(row))
+    return "\n".join(rendered_lines)
+
 def pretty_status(st: Dict[str, Any]) -> str:
     j, a, e = st["jogadas"], st["acertos"], st["erros"]
     taxa = (a / j * 100.0) if j > 0 else 0.0
@@ -105,9 +148,6 @@ def pretty_status(st: Dict[str, Any]) -> str:
         f"• 🧠 <b>Sinal pendente:</b> {label_pend}"
     )
 
-def as_symbol(c: str) -> str:
-    return "🔴" if c == "R" else ("⚫" if c == "B" else "🟢")
-
 # =========================
 # Estatística da janela
 # =========================
@@ -117,7 +157,6 @@ def decide_signal(history: List[str]) -> Optional[str]:
     - Usa only R/B (ignora Z) para teste chi-quadrado df=1.
     - Requer gap mínimo e valor de qui-quadrado acima do crítico em 1%.
     """
-    # pega última janela
     window = history[-WINDOW:] if len(history) > WINDOW else history[:]
     rb = [h for h in window if h in ("R", "B")]
     n = len(rb)
@@ -126,15 +165,13 @@ def decide_signal(history: List[str]) -> Optional[str]:
 
     r = rb.count("R")
     b = n - r
-    # expectativa sob H0 (justa, ignorando zeros): 50/50
-    exp = n / 2.0
+    exp = n / 2.0  # expectativa sob H0 (50/50, ignorando zeros)
     chi2 = 0.0
     if exp > 0:
         chi2 = ((r - exp) ** 2) / exp + ((b - exp) ** 2) / exp
 
     gap = abs(r - b)
     if chi2 >= CHI2_CRIT_DF1 and gap >= GAP_MIN:
-        # Direção do viés
         return "R" if r > b else "B"
     return None
 
@@ -159,18 +196,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def estrategia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "📚 <b>Metodologia Premium (resumo)</b>\n"
-        "• Janela deslizante das últimas <b>{}</b> jogadas.\n"
-        "• Teste <b>Qui-Quadrado</b> (df=1, α=1%) em <b>Vermelho vs Preto</b> (ignora zeros).\n"
-        "• Sinal apenas se <b>evidência forte</b> (χ² ≥ 6,635) e <b>gap</b> mínimo entre cores.\n"
-        "• Após avaliar um sinal, aguarda <b>{}</b> giros antes de emitir outro.\n"
-        "• Saídas “Sem vantagem” protegem seu bankroll de entradas -EV.\n\n"
-        "💡 Zero (0) reinicia parcialmente a leitura (não influencia no teste de cor).".format(WINDOW, COOLDOWN_AFTER_EVAL),
+        f"• Janela deslizante das últimas <b>{WINDOW}</b> jogadas (R/B; zeros ignorados).\n"
+        "• Teste <b>Qui-Quadrado</b> (df=1, α=1%) em <b>Vermelho vs Preto</b>.\n"
+        f"• Sinal apenas se <b>χ² ≥ {CHI2_CRIT_DF1}</b> e <b>gap ≥ {GAP_MIN}</b>.\n"
+        f"• Após avaliar um sinal, aguarda <b>{COOLDOWN_AFTER_EVAL}</b> giros (cooldown).\n"
+        "• Zero (0) é registrado, mas não entra no teste de cor.\n\n"
+        "💡 Filosofia: Sem vantagem detectada → sem entrada (-EV).",
         reply_markup=KB,
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(update.effective_user.id)
-    await update.message.reply_html(pretty_status(st), reply_markup=KB)
+    j, a, e = st["jogadas"], st["acertos"], st["erros"]
+    taxa = (a / j * 100.0) if j > 0 else 0.0
+    hist_grid = render_history_grid(st["history"])
+    await update.message.reply_html(
+        "📊 <b>Status Premium</b>\n"
+        f"• 🎯 <b>Jogadas:</b> {j}\n"
+        f"• ✅ <b>Acertos:</b> {a}\n"
+        f"• ❌ <b>Erros:</b> {e}\n"
+        f"• 📈 <b>Taxa:</b> {taxa:.2f}%\n\n"
+        "🧩 <b>Histórico (grade fixa):</b>\n"
+        f"{hist_grid}",
+        reply_markup=KB,
+    )
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -197,10 +246,8 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         obs = "Z"
 
-    # 1) Atualiza histórico
+    # 1) Atualiza histórico (ilimitado; não cortar)
     st["history"].append(obs)
-    if len(st["history"]) > 500:
-        st["history"] = st["history"][-500:]  # teto de memória
 
     # 2) Se havia sinal pendente, avalia neste giro
     outcome_msg = ""
@@ -219,14 +266,16 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["pending_signal"] = None
         st["cooldown_left"] = COOLDOWN_AFTER_EVAL
 
+    hist_grid = render_history_grid(st["history"])
+
     # 3) Se cooldown > 0, apenas consome uma unidade
     if st["cooldown_left"] > 0:
         st["cooldown_left"] -= 1
         await update.message.reply_html(
-            "{}\n\n⏳ <b>Coletando dados (cooldown).</b>\n{}".format(
-                outcome_msg or "📥 Resultado registrado.",
-                pretty_status(st)
-            ),
+            "{}\n\n⏳ <b>Coletando dados (cooldown).</b>\n"
+            "🧩 <b>Histórico (grade fixa):</b>\n"
+            f"{hist_grid}\n\n"
+            f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
             reply_markup=KB,
         )
         return
@@ -237,10 +286,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if signal is None:
         # Sem evidência forte
         await update.message.reply_html(
-            "{}\n\n🧪 <b>Sem vantagem estatística.</b> Continuando a coleta…\n{}".format(
-                outcome_msg or "📥 Resultado registrado.",
-                pretty_status(st)
-            ),
+            "{}\n\n🧪 <b>Sem vantagem estatística.</b> Continuando a coleta…\n"
+            "🧩 <b>Histórico (grade fixa):</b>\n"
+            f"{hist_grid}\n\n"
+            f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
             reply_markup=KB,
         )
         return
@@ -250,13 +299,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cor_txt = "🔴 Vermelho" if signal == "R" else "⚫ Preto"
     await update.message.reply_html(
         "{}\n\n🎯 <b>Recomendação Premium</b>\n"
-        "• Apostar em: <b>{}</b>\n"
-        "• Motivo: <i>viés de cor detectado</i> (χ² ≥ 6,635 e gap ≥ {}).\n\n"
-        "👉 <b>Agora envie o próximo resultado</b> para avaliarmos o sinal."
-        "\n\n{}".format(
-            outcome_msg or "📥 Resultado registrado.",
-            cor_txt, GAP_MIN, pretty_status(st)
-        ),
+        f"• Apostar em: <b>{cor_txt}</b>\n"
+        f"• Motivo: <i>viés de cor detectado</i> (χ² ≥ {CHI2_CRIT_DF1} e gap ≥ {GAP_MIN}).\n\n"
+        "🧩 <b>Histórico (grade fixa):</b>\n"
+        f"{hist_grid}\n\n"
+        f"{pretty_status(st)}".format(outcome_msg or "📥 Resultado registrado."),
         reply_markup=KB,
     )
 
