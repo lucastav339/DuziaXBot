@@ -1,7 +1,7 @@
 # main.py — PTB 21.6 + aiohttp (Render)
 # Estratégia ÚNICA: /faixa (Altos/Baixos + mesma cor) com Gale 1x
 # UI: Teclado INLINE com botões 0–36 (texto curto: 🔴23 / ⚫24 / 🟢0).
-# Corrigido: sem reticências nos botões + mensagem "Registrado: ..." com número/cor/faixa.
+# Adição: históricos fixos de números por cor (🔴 e ⚫) além do histórico de cores (bolinhas).
 
 import os
 import sys
@@ -43,11 +43,15 @@ log.info(f"Python: {sys.version}")
 log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 
 # ======= Parâmetros/UI =======
-HISTORY_COLS = 30
+HISTORY_COLS = 30             # bolinhas
 MAX_HISTORY_ROWS = 8
 HISTORY_PLACEHOLDER = "◻️"
 POSTWIN_SPINS = int(os.getenv("POSTWIN_SPINS", "5"))
-MAX_PER_ROW = 7  # <== menos botões por linha para evitar reticências
+MAX_PER_ROW = 7               # botões por linha (evita reticências)
+
+# Grades de números por cor
+NUM_HISTORY_COLS = int(os.getenv("NUM_HISTORY_COLS", "15"))
+NUM_PLACEHOLDER = "··"        # placeholder numérico (2 chars)
 
 # ======= Mapeamento cor (Roleta Europeia) =======
 RED_SET = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -87,11 +91,13 @@ def _fresh_state() -> Dict[str, Any]:
         "jogadas": 0,
         "acertos": 0,
         "erros": 0,
-        "history": [],
-        "numbers": [],
+        "history": [],           # "R","B","Z"
+        "numbers": [],           # sequência completa de números (inclui 0)
+        "red_numbers": [],       # histórico só de números vermelhos
+        "black_numbers": [],     # histórico só de números pretos
         "postwin_wait_left": 0,
-        "pending_bucket": None,           # ("H"/"L", "R"/"B")
-        "pending_bucket_stage": None,     # None|"base"|"gale"
+        "pending_bucket": None,          # ("H"/"L", "R"/"B")
+        "pending_bucket_stage": None,    # None|"base"|"gale"
     }
 
 def get_state(uid: int) -> Dict[str, Any]:
@@ -123,6 +129,9 @@ def build_numeric_keyboard() -> InlineKeyboardMarkup:
         rows.append(current)
     return InlineKeyboardMarkup(rows)
 
+# =========================
+# Renders — histórico de cores e de números por cor
+# =========================
 def as_symbol(c: str) -> str:
     return "🔴" if c == "R" else ("⚫" if c == "B" else "🟢")
 
@@ -144,6 +153,33 @@ def render_history_grid(history: List[str]) -> str:
     for idx, row in enumerate(rows_to_show, start=start_row_index):
         prefix = f"L{idx:02d}: "
         rendered_lines.append(prefix + "".join(row))
+    return "\n".join(rendered_lines)
+
+def render_numbers_grid(nums: List[int]) -> str:
+    """
+    Renderiza números em grade fixa com NUM_HISTORY_COLS por linha.
+    Usa <code> e números 2 dígitos (02) para alinhar. Preenche com placeholder.
+    """
+    if not nums:
+        return "<code>" + (NUM_PLACEHOLDER * NUM_HISTORY_COLS) + "</code>"
+    # cria blocos de 2 chars (zero-padded)
+    blocks = [f"{n:02d}" for n in nums]
+    rows: List[List[str]] = []
+    for i in range(0, len(blocks), NUM_HISTORY_COLS):
+        rows.append(blocks[i:i + NUM_HISTORY_COLS])
+    # pad da última
+    last = rows[-1]
+    if len(last) < NUM_HISTORY_COLS:
+        last = last + [NUM_PLACEHOLDER] * (NUM_HISTORY_COLS - len(last))
+        rows[-1] = last
+    # limitar a no máx. MAX_HISTORY_ROWS
+    rows_to_show = rows[-MAX_HISTORY_ROWS:]
+    rendered_lines: List[str] = []
+    total_rows = len(rows)
+    start_row_index = total_rows - len(rows_to_show) + 1
+    for idx, row in enumerate(rows_to_show, start=start_row_index):
+        prefix = f"L{idx:02d}: "
+        rendered_lines.append(prefix + "<code>" + " ".join(row) + "</code>")
     return "\n".join(rendered_lines)
 
 def pretty_status(st: Dict[str, Any]) -> str:
@@ -245,9 +281,12 @@ def _tick_postwin_and_maybe_reset(st: Dict[str, Any]) -> Optional[str]:
     remaining = st["postwin_wait_left"]
     if remaining > 0:
         return f"⏳ <b>Coleta pós-acerto:</b> {POSTWIN_SPINS-remaining}/{POSTWIN_SPINS}. Sem novos sinais."
+    # reset somente de históricos
     st["history"] = []
     st["numbers"] = []
-    return "♻️ <b>Coleta concluída.</b> Histórico zerado. Reiniciando análise."
+    st["red_numbers"] = []
+    st["black_numbers"] = []
+    return "♻️ <b>Coleta concluída.</b> Históricos zerados. Reiniciando análise."
 
 # =========================
 # Handlers
@@ -261,7 +300,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Clique no <b>número</b> que saiu:\n"
         "• Gatilho: 4 números seguidos (sem zero) todos <b>Altos</b> ou todos <b>Baixos</b> e da <b>mesma cor</b>.\n"
         "• Sinal: aposta nos <b>9 números</b> da faixa+cor (Gale 1x se base errar).\n"
-        "• Zero (🟢) não avalia. Pós-acerto: 5 coletas + reset do histórico.",
+        "• Zero (🟢) não avalia. Pós-acerto: 5 coletas + reset dos históricos.",
         reply_markup=kb,
     )
 
@@ -271,8 +310,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "📊 <b>Status</b>\n"
         f"{pretty_status(st)}\n\n"
-        "🧩 <b>Histórico (grade fixa):</b>\n"
-        f"{render_history_grid(st['history'])}",
+        "🧩 <b>Histórico (grade fixa) — Cores:</b>\n"
+        f"{render_history_grid(st['history'])}\n\n"
+        "🔴 <b>Histórico (números vermelhos):</b>\n"
+        f"{render_numbers_grid(st['red_numbers'])}\n\n"
+        "⚫ <b>Histórico (números pretos):</b>\n"
+        f"{render_numbers_grid(st['black_numbers'])}",
         reply_markup=kb,
     )
 
@@ -280,14 +323,19 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     STATE[uid] = _fresh_state()
     kb = build_numeric_keyboard()
-    await update.message.reply_html("♻️ <b>Histórico e placar resetados.</b>", reply_markup=kb)
+    await update.message.reply_html("♻️ <b>Históricos e placar resetados.</b>", reply_markup=kb)
 
 def _append_spin(st: Dict[str, Any], n: int) -> None:
     st["numbers"].append(n)
     if n == 0:
         st["history"].append("Z")
     else:
-        st["history"].append(color_of(n) or "Z")
+        c = color_of(n) or "Z"
+        st["history"].append(c)
+        if c == "R":
+            st["red_numbers"].append(n)
+        elif c == "B":
+            st["black_numbers"].append(n)
 
 def _label_color_full(n: int) -> str:
     if n == 0:
@@ -303,7 +351,7 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
     # 1) Atualiza histórico
     _append_spin(st, n)
 
-    # 2) Confirmação explícita ao usuário (número, cor e faixa)
+    # 2) Confirmação explícita
     header = f"📥 <b>Registrado:</b> {label_for_number(n)} • {_label_color_full(n)} • {_label_hilo(n)}"
 
     # 3) Avalia pendência /faixa (com Gale)
@@ -320,7 +368,9 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
         kb = build_numeric_keyboard()
         await message_fn(
             "\n".join(msgs) + "\n\n" +
-            "🧩 <b>Histórico (grade fixa):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+            "🧩 <b>Histórico (grade fixa) — Cores:</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+            "🔴 <b>Histórico (números vermelhos):</b>\n" + render_numbers_grid(st["red_numbers"]) + "\n\n" +
+            "⚫ <b>Histórico (números pretos):</b>\n" + render_numbers_grid(st["black_numbers"]) + "\n\n" +
             pretty_status(st),
             reply_markup=kb
         )
@@ -347,7 +397,9 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
     kb = build_numeric_keyboard()
     await message_fn(
         "\n".join(msgs) + "\n\n" +
-        "🧩 <b>Histórico (grade fixa):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+        "🧩 <b>Histórico (grade fixa) — Cores:</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+        "🔴 <b>Histórico (números vermelhos):</b>\n" + render_numbers_grid(st["red_numbers"]) + "\n\n" +
+        "⚫ <b>Histórico (números pretos):</b>\n" + render_numbers_grid(st["black_numbers"]) + "\n\n" +
         pretty_status(st),
         reply_markup=kb
     )
