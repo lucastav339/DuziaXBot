@@ -374,9 +374,7 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
                 "🎯 <b>Sinal — Faixa</b>\n"
                 f"• Faixa: <b>{faixa_name}</b> • Cor: <b>{cor_txt}</b>\n"
                 f"• Números: <code>{', '.join(map(str, nums))}</code>\n"
-                "• <b>Gale 1x</b> habilitado (se base errar).\n"
-                "👉 Clique no próximo número que sair."
-            )
+                            )
 
     await message_fn(
         "\n".join(msgs) + "\n\n" +
