@@ -3,7 +3,7 @@
 # UI: Teclado INLINE 0–36 (texto curto: 🔴23 / ⚫24 / 🟢0) + botões fixos:
 #     • 🗑️ Limpar  → desfaz APENAS o último número informado (UNDO, sem apagar mensagens)
 #     • ♻️ Resetar → reseta APENAS o histórico/placar/sinais (sem apagar mensagens)
-# Históricos: cores (bolinhas) e números (unificado), ambos ESQ→DIR.
+# Históricos (ESQ→DIR): 15 cores (bolinhas) e 15 números (00–36).
 
 import os
 import sys
@@ -45,20 +45,20 @@ log.info(f"Python: {sys.version}")
 log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 
 # ======= Parâmetros/UI =======
-HISTORY_COLS = 30
-MAX_HISTORY_ROWS = 8
+HISTORY_COLS = 15           # mostra só 15 cores por linha
+MAX_HISTORY_ROWS = 1        # apenas 1 linha (15 cores)
 HISTORY_PLACEHOLDER = "◻️"
 POSTWIN_SPINS = int(os.getenv("POSTWIN_SPINS", "5"))
-MAX_PER_ROW = 7
+MAX_PER_ROW = 7             # botões por linha (evita reticências)
 
-NUM_HISTORY_COLS = int(os.getenv("NUM_HISTORY_COLS", "15"))
-NUM_PLACEHOLDER = "··"
+NUM_HISTORY_COLS = 15       # mostra só 15 números por linha
+NUM_PLACEHOLDER = "··"      # placeholder numérico (2 chars)
 
 # ======= Mapeamento cor (Roleta Europeia) =======
 RED_SET = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 BLACK_SET = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
-HIGH_SET = set(range(19, 37))
-LOW_SET  = set(range(1, 19))
+HIGH_SET = set(range(19, 37))   # 19-36
+LOW_SET  = set(range(1, 19))    # 1-18
 
 HIGH_RED   = sorted(list(HIGH_SET & RED_SET))
 HIGH_BLACK = sorted(list(HIGH_SET & BLACK_SET))
@@ -152,13 +152,18 @@ def build_numeric_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 # =========================
-# Renders — ESQ→DIR
+# Renders — ESQ→DIR (MOSTRANDO SÓ 15)
 # =========================
 def as_symbol(c: str) -> str:
     return "🔴" if c == "R" else ("⚫" if c == "B" else "🟢")
 
 def render_history_grid(history: List[str]) -> str:
-    syms = [as_symbol(c) for c in history]
+    """
+    Grade fixa de CORES (bolinhas) mostrando SOMENTE os últimos 15 (ESQ→DIR).
+    Completa com placeholder à direita.
+    """
+    # pega só as últimas 15 cores
+    syms = [as_symbol(c) for c in history][-HISTORY_COLS:]
     rows: List[List[str]] = []
     for i in range(0, len(syms), HISTORY_COLS):
         rows.append(syms[i:i + HISTORY_COLS])
@@ -168,18 +173,23 @@ def render_history_grid(history: List[str]) -> str:
     if len(last) < HISTORY_COLS:
         last = last + [HISTORY_PLACEHOLDER] * (HISTORY_COLS - len(last))
         rows[-1] = last
-    rows_to_show = rows[-MAX_HISTORY_ROWS:]
+    rows_to_show = rows[-MAX_HISTORY_ROWS:]  # = 1 linha
     rendered_lines: List[str] = []
     total_rows = len(rows)
-    start_idx = total_rows - len(rows_to_show) + 1
-    for idx, row in enumerate(rows_to_show, start=start_idx):
-        rendered_lines.append(f"L{idx:02d}: " + "".join(row))
+    start_row_index = total_rows - len(rows_to_show) + 1
+    for idx, row in enumerate(rows_to_show, start=start_row_index):
+        prefix = f"L{idx:02d}: "
+        rendered_lines.append(prefix + "".join(row))
     return "\n".join(rendered_lines)
 
 def render_numbers_grid(nums: List[int]) -> str:
-    if not nums:
+    """
+    Grade fixa de NÚMEROS (unificado) mostrando SOMENTE os últimos 15 (ESQ→DIR).
+    Usa blocos 2 dígitos (00..36). Completa com placeholder à direita.
+    """
+    blocks = [f"{n:02d}" for n in nums][-NUM_HISTORY_COLS:]
+    if not blocks:
         return "<code>" + " ".join([NUM_PLACEHOLDER] * NUM_HISTORY_COLS) + "</code>"
-    blocks = [f"{n:02d}" for n in nums]
     rows: List[List[str]] = []
     for i in range(0, len(blocks), NUM_HISTORY_COLS):
         rows.append(blocks[i:i + NUM_HISTORY_COLS])
@@ -187,12 +197,13 @@ def render_numbers_grid(nums: List[int]) -> str:
     if len(last) < NUM_HISTORY_COLS:
         last = last + [NUM_PLACEHOLDER] * (NUM_HISTORY_COLS - len(last))
         rows[-1] = last
-    rows_to_show = rows[-MAX_HISTORY_ROWS:]
+    rows_to_show = rows[-1:]  # apenas a última linha
     rendered_lines: List[str] = []
     total_rows = len(rows)
-    start_idx = total_rows - len(rows_to_show) + 1
-    for idx, row in enumerate(rows_to_show, start=start_idx):
-        rendered_lines.append(f"L{idx:02d}: " + "<code>" + " ".join(row) + "</code>")
+    start_row_index = total_rows - len(rows_to_show) + 1
+    for idx, row in enumerate(rows_to_show, start=start_row_index):
+        prefix = f"L{idx:02d}: "
+        rendered_lines.append(prefix + "<code>" + " ".join(row) + "</code>")
     return "\n".join(rendered_lines)
 
 def pretty_status(st: Dict[str, Any]) -> str:
@@ -212,10 +223,7 @@ def pretty_status(st: Dict[str, Any]) -> str:
         "🏷️ <b>Status</b>\n"
         f"• 🎯 <b>Jogadas:</b> {j}\n"
         f"• ✅ <b>Acertos:</b> {a}\n"
-        f"• ❌ <b>Erros:</b> {e}\n"
-        f"• 📈 <b>Taxa:</b> {taxa:.2f}%\n"
-        f"• 🎯 <b>Sinal pendente:</b> {bucket_txt}\n"
-        f"• ⌛ <b>Pós-acerto:</b> {post}/{POSTWIN_SPINS if post>0 else 0}"
+        f"• ❌ <b>Erros:</b> {e}\n"       
     )
 
 # =========================
@@ -305,9 +313,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "📊 <b>Status</b>\n"
         f"{pretty_status(st)}\n\n"
-        "🧩 <b>Histórico — Cores:</b>\n"
+        "🧩 <b>Histórico — Cores (últimos 15):</b>\n"
         f"{render_history_grid(st['history'])}\n\n"
-        "🔢 <b>Histórico — Números:</b>\n"
+        "🔢 <b>Histórico — Números (últimos 15):</b>\n"
         f"{render_numbers_grid(st['numbers'])}",
         reply_markup=build_numeric_keyboard(),
     )
@@ -346,8 +354,8 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
         msgs.append(post_msg)
         await message_fn(
             "\n".join(msgs) + "\n\n" +
-            "🧩 <b>Histórico — Cores:</b>\n" + render_history_grid(st["history"]) + "\n\n" +
-            "🔢 <b>Histórico — Números:</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
+            "🧩 <b>Histórico — Cores (últimos 15):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+            "🔢 <b>Histórico — Números (últimos 15):</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
             pretty_status(st),
             reply_markup=build_numeric_keyboard()
         )
@@ -372,8 +380,8 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
 
     await message_fn(
         "\n".join(msgs) + "\n\n" +
-        "🧩 <b>Histórico — Cores:</b>\n" + render_history_grid(st["history"]) + "\n\n" +
-        "🔢 <b>Histórico — Números:</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
+        "🧩 <b>Histórico — Cores (últimos 15):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+        "🔢 <b>Histórico — Números (últimos 15):</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
         pretty_status(st),
         reply_markup=build_numeric_keyboard()
     )
@@ -417,8 +425,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🗑️ <b>Último número removido.</b>\n"
             "👉 Informe o número correto clicando nos botões abaixo.\n\n"
-            "🧩 <b>Histórico — Cores:</b>\n" + render_history_grid(st["history"]) + "\n\n" +
-            "🔢 <b>Histórico — Números:</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
+            "🧩 <b>Histórico — Cores (últimos 15):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+            "🔢 <b>Histórico — Números (últimos 15):</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
             pretty_status(st)
         )
         try:
@@ -434,8 +442,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "♻️ <b>Históricos e placar resetados.</b>\n"
             "👉 Informe o próximo número.\n\n"
-            "🧩 <b>Histórico — Cores:</b>\n" + render_history_grid([]) + "\n\n" +
-            "🔢 <b>Histórico — Números:</b>\n" + render_numbers_grid([]) + "\n\n" +
+            "🧩 <b>Histórico — Cores (últimos 15):</b>\n" + render_history_grid([]) + "\n\n" +
+            "🔢 <b>Histórico — Números (últimos 15):</b>\n" + render_numbers_grid([]) + "\n\n" +
             pretty_status(STATE[uid])
         )
         try:
