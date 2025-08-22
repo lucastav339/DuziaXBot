@@ -1,0 +1,1 @@
+<conteúdo do scraper.py adaptado para a estrutura que o usuário enviou>

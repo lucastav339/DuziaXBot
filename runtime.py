@@ -1,0 +1,1 @@
+<conteúdo do runtime.py para webhook/polling>
