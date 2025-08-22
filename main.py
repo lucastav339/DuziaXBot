@@ -1,14 +1,7 @@
 # main.py — PTB 21.6 + aiohttp (Render)
 # Estratégia ÚNICA: /faixa (Altos/Baixos + mesma cor) com Gale 1x
-#
-# UI: Teclado INLINE com botões 0–36 (cada um já com cor: 🔴/⚫/🟢). Clique = registra número.
-#
-# Requisitos:
-#   python-telegram-bot==21.6
-#   aiohttp==3.10.5
-#
-# ENV:
-#   BOT_TOKEN, WEBHOOK_URL, (opcional) WEBHOOK_PATH, TG_SECRET_TOKEN, PORT
+# UI: Teclado INLINE com botões 0–36 (texto curto: 🔴23 / ⚫24 / 🟢0).
+# Corrigido: sem reticências nos botões + mensagem "Registrado: ..." com número/cor/faixa.
 
 import os
 import sys
@@ -25,24 +18,21 @@ from telegram.ext import (
     MessageHandler, CallbackQueryHandler, filters
 )
 
-# =========================
-# Config & ENV
-# =========================
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 log = logging.getLogger("duziaxbot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")                    # ex: https://duziaxbot.onrender.com
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook")       # personalize (ex: webhook-a7d1c3)
-SECRET_TOKEN = os.getenv("TG_SECRET_TOKEN")               # recomendado
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "webhook")
+SECRET_TOKEN = os.getenv("TG_SECRET_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Defina BOT_TOKEN")
 if not WEBHOOK_URL:
-    raise RuntimeError("Defina WEBHOOK_URL (https://...onrender.com)")
+    raise RuntimeError("Defina WEBHOOK_URL")
 
 try:
     import telegram
@@ -52,24 +42,23 @@ except Exception:
 log.info(f"Python: {sys.version}")
 log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 
-# ======= Parâmetros =======
+# ======= Parâmetros/UI =======
 HISTORY_COLS = 30
 MAX_HISTORY_ROWS = 8
 HISTORY_PLACEHOLDER = "◻️"
-
-POSTWIN_SPINS = int(os.getenv("POSTWIN_SPINS", "5"))  # coletas pós-acerto
+POSTWIN_SPINS = int(os.getenv("POSTWIN_SPINS", "5"))
+MAX_PER_ROW = 7  # <== menos botões por linha para evitar reticências
 
 # ======= Mapeamento cor (Roleta Europeia) =======
 RED_SET = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 BLACK_SET = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
-
 HIGH_SET = set(range(19, 37))   # 19-36
 LOW_SET  = set(range(1, 19))    # 1-18
 
-HIGH_RED   = sorted(list(HIGH_SET & RED_SET))    # 9 números
-HIGH_BLACK = sorted(list(HIGH_SET & BLACK_SET))  # 9 números
-LOW_RED    = sorted(list(LOW_SET  & RED_SET))    # 9 números
-LOW_BLACK  = sorted(list(LOW_SET  & BLACK_SET))  # 9 números
+HIGH_RED   = sorted(list(HIGH_SET & RED_SET))
+HIGH_BLACK = sorted(list(HIGH_SET & BLACK_SET))
+LOW_RED    = sorted(list(LOW_SET  & RED_SET))
+LOW_BLACK  = sorted(list(LOW_SET  & BLACK_SET))
 
 def color_of(n: int) -> Optional[str]:
     if n == 0: return None
@@ -91,13 +80,6 @@ def bucket_numbers(hilo: str, color: str) -> List[int]:
 # =========================
 # Estado por usuário
 # =========================
-# Campos:
-# - jogadas, acertos, erros
-# - history: List[str] com {"R","B","Z"}
-# - numbers: List[Optional[int]] (número clicado; None não ocorre aqui)
-# - postwin_wait_left: int  — contador pós-acerto
-# - pending_bucket: Optional[Tuple["H"|"L","R"|"B"]] — pendência da estratégia /faixa
-# - pending_bucket_stage: None | "base" | "gale" — estágio do Gale na /faixa
 STATE: Dict[int, Dict[str, Any]] = {}
 
 def _fresh_state() -> Dict[str, Any]:
@@ -108,41 +90,37 @@ def _fresh_state() -> Dict[str, Any]:
         "history": [],
         "numbers": [],
         "postwin_wait_left": 0,
-        "pending_bucket": None,
-        "pending_bucket_stage": None,
+        "pending_bucket": None,           # ("H"/"L", "R"/"B")
+        "pending_bucket_stage": None,     # None|"base"|"gale"
     }
 
-def get_state(user_id: int) -> Dict[str, Any]:
-    if user_id not in STATE:
-        STATE[user_id] = _fresh_state()
-    return STATE[user_id]
+def get_state(uid: int) -> Dict[str, Any]:
+    if uid not in STATE:
+        STATE[uid] = _fresh_state()
+    return STATE[uid]
 
 # =========================
 # UI — Teclado Inline 0–36
 # =========================
 def label_for_number(n: int) -> str:
+    # Sem espaço para caber melhor (evita ...):
     if n == 0:
-        return "🟢 0"
-    return f"{'🔴' if n in RED_SET else '⚫'} {n}"
+        return "🟢0"
+    return f"{'🔴' if n in RED_SET else '⚫'}{n}"
 
 def build_numeric_keyboard() -> InlineKeyboardMarkup:
-    """
-    Distribuição em linhas:
-    0 sozinho
-    1–9, 10–18, 19–27, 28–36 (9 por linha)
-    """
     rows: List[List[InlineKeyboardButton]] = []
-
-    # zero
+    # 0 sozinho
     rows.append([InlineKeyboardButton(text=label_for_number(0), callback_data="num:0")])
-
-    # faixas de 1 a 36
-    for start in (1, 10, 19, 28):
-        row: List[InlineKeyboardButton] = []
-        for n in range(start, min(start + 9, 37)):
-            row.append(InlineKeyboardButton(text=label_for_number(n), callback_data=f"num:{n}"))
-        rows.append(row)
-
+    # 1..36 quebrado em linhas de MAX_PER_ROW
+    current: List[InlineKeyboardButton] = []
+    for n in range(1, 37):
+        current.append(InlineKeyboardButton(text=label_for_number(n), callback_data=f"num:{n}"))
+        if len(current) == MAX_PER_ROW:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
     return InlineKeyboardMarkup(rows)
 
 def as_symbol(c: str) -> str:
@@ -192,12 +170,12 @@ def pretty_status(st: Dict[str, Any]) -> str:
     )
 
 # =========================
-# Estratégia /faixa (gatilho + avaliação com Gale 1x)
+# Estratégia /faixa (gatilho + Gale 1x)
 # =========================
 def last_k_nonzero(numbers: List[int], k: int) -> Optional[List[int]]:
     buf: List[int] = []
     for n in reversed(numbers):
-        if n == 0:   # zero quebra a sequência
+        if n == 0:
             break
         buf.append(n)
         if len(buf) == k:
@@ -207,12 +185,6 @@ def last_k_nonzero(numbers: List[int], k: int) -> Optional[List[int]]:
     return list(reversed(buf))
 
 def faixa_trigger(numbers: List[int]) -> Optional[Tuple[str,str]]:
-    """
-    Se os últimos 4 números consecutivos não-zeros existirem e forem:
-      - todos 'H' (19-36) OU todos 'L' (1-18)
-      - e todos da MESMA cor (R/B)
-    então retorna (hilo, color) → ("H"/"L", "R"/"B")
-    """
     seq = last_k_nonzero(numbers, 4)
     if not seq:
         return None
@@ -225,23 +197,15 @@ def faixa_trigger(numbers: List[int]) -> Optional[Tuple[str,str]]:
     return None
 
 def evaluate_faixa_on_spin(st: Dict[str, Any], num: int) -> str:
-    """
-    Avalia pendência da /faixa com Gale 1x:
-      - BASE: se num ∈ conjunto → ACERTO; se num==0 → aguarda; se fora → entra GALE (sem contar erro)
-      - GALE: se num ∈ conjunto → ACERTO (sem contar erro da base); se fora → ERRO
-    """
     msg = ""
     bucket = st.get("pending_bucket")
     stage  = st.get("pending_bucket_stage")
     if not bucket:
         return msg
-
     if num == 0:
         return "🏆 <b>/faixa:</b> 🟢 Zero — aguardando avaliação."
-
     hilo, col = bucket
     allowed = set(bucket_numbers(hilo, col))
-
     if stage == "base":
         if num in allowed:
             st["jogadas"] += 1
@@ -294,24 +258,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = build_numeric_keyboard()
     await update.message.reply_html(
         "🎯 <b>iDozen — Estratégia Faixa c/ Gale 1x</b>\n"
-        "Envie o resultado clicando no <b>número</b> abaixo.\n"
+        "Clique no <b>número</b> que saiu:\n"
         "• Gatilho: 4 números seguidos (sem zero) todos <b>Altos</b> ou todos <b>Baixos</b> e da <b>mesma cor</b>.\n"
-        "• Sinal: aposta nos <b>9 números</b> da faixa+cor.\n"
-        "• Gale 1x: se base errar (≠0), repete 1x.\n"
-        "• Zero (🟢) não avalia.\n"
-        "• Pós-acerto: coleta 5 giros e zera apenas o histórico.",
+        "• Sinal: aposta nos <b>9 números</b> da faixa+cor (Gale 1x se base errar).\n"
+        "• Zero (🟢) não avalia. Pós-acerto: 5 coletas + reset do histórico.",
         reply_markup=kb,
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(update.effective_user.id)
-    hist_grid = render_history_grid(st["history"])
     kb = build_numeric_keyboard()
     await update.message.reply_html(
         "📊 <b>Status</b>\n"
         f"{pretty_status(st)}\n\n"
         "🧩 <b>Histórico (grade fixa):</b>\n"
-        f"{hist_grid}",
+        f"{render_history_grid(st['history'])}",
         reply_markup=kb,
     )
 
@@ -322,25 +283,37 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("♻️ <b>Histórico e placar resetados.</b>", reply_markup=kb)
 
 def _append_spin(st: Dict[str, Any], n: int) -> None:
-    # Atualiza históricos
     st["numbers"].append(n)
     if n == 0:
         st["history"].append("Z")
     else:
         st["history"].append(color_of(n) or "Z")
 
+def _label_color_full(n: int) -> str:
+    if n == 0:
+        return "🟢 Zero"
+    return "🔴 Vermelho" if n in RED_SET else "⚫ Preto"
+
+def _label_hilo(n: int) -> str:
+    if n == 0:
+        return "Zero"
+    return "Alto" if n in HIGH_SET else "Baixo"
+
 async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
     # 1) Atualiza histórico
     _append_spin(st, n)
 
-    # 2) Avalia pendência /faixa (com Gale)
-    msgs: List[str] = []
+    # 2) Confirmação explícita ao usuário (número, cor e faixa)
+    header = f"📥 <b>Registrado:</b> {label_for_number(n)} • {_label_color_full(n)} • {_label_hilo(n)}"
+
+    # 3) Avalia pendência /faixa (com Gale)
+    msgs: List[str] = [header]
     if st.get("pending_bucket"):
         m = evaluate_faixa_on_spin(st, n)
         if m:
             msgs.append(m)
 
-    # 3) Pós-acerto ativo?
+    # 4) Pós-acerto ativo?
     post_msg = _tick_postwin_and_maybe_reset(st)
     if post_msg:
         msgs.append(post_msg)
@@ -353,7 +326,7 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
         )
         return
 
-    # 4) Se não há pendência e não está em pós-acerto, tentar gerar novo sinal
+    # 5) Se não há pendência e não está em pós-acerto, tentar gerar novo sinal
     if st.get("pending_bucket") is None and st.get("postwin_wait_left", 0) == 0 and n != 0:
         trig = faixa_trigger(st["numbers"])
         if trig:
@@ -371,11 +344,9 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
                 "👉 Clique no próximo número que sair."
             )
 
-    # 5) Responder com status e teclado
-    base_msg = "\n".join(msgs) if msgs else "📥 Resultado registrado."
     kb = build_numeric_keyboard()
     await message_fn(
-        base_msg + "\n\n" +
+        "\n".join(msgs) + "\n\n" +
         "🧩 <b>Histórico (grade fixa):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
         pretty_status(st),
         reply_markup=kb
@@ -397,10 +368,10 @@ async def on_number_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    await query.answer(text=f"Registrado: {label_for_number(n)}", show_alert=False)
+    # Toast curto
+    await query.answer(text=f"Registrado {label_for_number(n)}", show_alert=False)
 
     async def reply_fn(text: str, reply_markup: InlineKeyboardMarkup):
-        # Edita a mensagem do callback se possível; caso contrário, envia nova
         try:
             await query.message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
         except Exception:
