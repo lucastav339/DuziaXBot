@@ -312,9 +312,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "📊 <b>Status</b>\n"
         f"{pretty_status(st)}\n\n"
-        "🧩 <b>Histórico — Cores (últimos 15):</b>\n"
+        "🧩 <b>Histórico — Cores:</b>\n"
         f"{render_history_grid(st['history'])}\n\n"
-        "🔢 <b>Histórico — Números (últimos 15):</b>\n"
+        "🔢 <b>Histórico — Números:</b>\n"
         f"{render_numbers_grid(st['numbers'])}",
         reply_markup=build_numeric_keyboard(),
     )
@@ -341,7 +341,7 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
     st["snapshots"].append(_make_snapshot(st))
 
     _append_spin(st, n)
-    header = f"📥 <b>Registrado:</b> {label_for_number(n)} • {_label_color_full(n)} • {_label_hilo(n)}\n"
+    header = f"📥 <b>Registrado:</b> {label_for_number(n)} • {_label_color_full(n)} • {_label_hilo(n)}"
     msgs: List[str] = [header]
 
     if st.get("pending_bucket"):
