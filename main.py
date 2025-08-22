@@ -342,7 +342,7 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
     st["snapshots"].append(_make_snapshot(st))
 
     _append_spin(st, n)
-    header = f"📥 <b>Registrado:</b> {label_for_number(n)} • {_label_color_full(n)} • {_label_hilo(n)}"
+    header = f"📥 <b>Registrado:</b> {label_for_number(n)} • {_label_color_full(n)} • {_label_hilo(n)}\n"
     msgs: List[str] = [header]
 
     if st.get("pending_bucket"):
@@ -371,7 +371,7 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
             cor_txt = "🔴 Vermelho" if col == "R" else "⚫ Preto"
             nums = bucket_numbers(hilo, col)
             msgs.append(
-                "🎯 <b>Sinal — Faixa</b>\n"
+                "🎯 <b>SINAL ENTRADA</b> 🎯 \n"
                 f"• Faixa: <b>{faixa_name}</b> • Cor: <b>{cor_txt}</b>\n"
                 f"• Números: <code>{', '.join(map(str, nums))}</code>\n"
                             )
