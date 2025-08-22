@@ -219,9 +219,10 @@ def pretty_status(st: Dict[str, Any]) -> str:
         faixa = "Altos" if hilo == "H" else "Baixos"
         step = "BASE" if stage == "base" else ("GALE" if stage == "gale" else "—")
         bucket_txt = f"{faixa} {cor} ({step})"
-    return (
+return (
         "🏷️ <b>Status</b>\n"
-        f"• 🎯 <b>Jogadas:</b> {j}" "• ✅ <b>Acertos:</b> {a}" "• ❌ <b>Erros:</b> {e}"       
+        f"• 🎯 <b>Jogadas:</b> {j}\n" f"• ✅ <b>Acertos:</b> {a}\n" f"• ❌ <b>Erros:</b> {e}\n"
+
     )
 
 # =========================
