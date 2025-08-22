@@ -1,7 +1,9 @@
 # main.py — PTB 21.6 + aiohttp (Render)
-# Estratégia ÚNICA: /faixa (Altos/Baixos + mesma cor) com Gale 1x
-# UI: Teclado INLINE com botões 0–36 (texto curto: 🔴23 / ⚫24 / 🟢0).
-# Adição: históricos fixos de números por cor (🔴 e ⚫) além do histórico de cores (bolinhas).
+# Estratégia ÚNICA: Faixa (Altos/Baixos + mesma cor) com Gale 1x
+# UI: Teclado INLINE 0–36 (texto curto: 🔴23 / ⚫24 / 🟢0) + botões fixos:
+#     • 🗑️ Limpar (apaga a mensagem do bot e instrui a informar o número correto)
+#     • ♻️ Resetar (zera placar e históricos)
+# Históricos: cores (bolinhas) e números (unificado), ambos preenchidos ESQ→DIR.
 
 import os
 import sys
@@ -43,13 +45,13 @@ log.info(f"Python: {sys.version}")
 log.info(f"Webhook: {WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}")
 
 # ======= Parâmetros/UI =======
-HISTORY_COLS = 30             # bolinhas
+HISTORY_COLS = 30             # bolinhas (cores)
 MAX_HISTORY_ROWS = 8
 HISTORY_PLACEHOLDER = "◻️"
 POSTWIN_SPINS = int(os.getenv("POSTWIN_SPINS", "5"))
 MAX_PER_ROW = 7               # botões por linha (evita reticências)
 
-# Grades de números por cor
+# Grade fixa do histórico de NÚMEROS (unificado)
 NUM_HISTORY_COLS = int(os.getenv("NUM_HISTORY_COLS", "15"))
 NUM_PLACEHOLDER = "··"        # placeholder numérico (2 chars)
 
@@ -91,10 +93,8 @@ def _fresh_state() -> Dict[str, Any]:
         "jogadas": 0,
         "acertos": 0,
         "erros": 0,
-        "history": [],           # "R","B","Z"
-        "numbers": [],           # sequência completa de números (inclui 0)
-        "red_numbers": [],       # histórico só de números vermelhos
-        "black_numbers": [],     # histórico só de números pretos
+        "history": [],           # sequência de cores "R","B","Z"
+        "numbers": [],           # histórico UNIFICADO de números (inclui 0)
         "postwin_wait_left": 0,
         "pending_bucket": None,          # ("H"/"L", "R"/"B")
         "pending_bucket_stage": None,    # None|"base"|"gale"
@@ -106,10 +106,9 @@ def get_state(uid: int) -> Dict[str, Any]:
     return STATE[uid]
 
 # =========================
-# UI — Teclado Inline 0–36
+# UI — Teclado Inline 0–36 + FIXOS (Limpar/Resetar)
 # =========================
 def label_for_number(n: int) -> str:
-    # Sem espaço para caber melhor (evita ...):
     if n == 0:
         return "🟢0"
     return f"{'🔴' if n in RED_SET else '⚫'}{n}"
@@ -127,10 +126,15 @@ def build_numeric_keyboard() -> InlineKeyboardMarkup:
             current = []
     if current:
         rows.append(current)
+    # linha fixa de ações
+    rows.append([
+        InlineKeyboardButton(text="🗑️ Limpar", callback_data="clear_last"),
+        InlineKeyboardButton(text="♻️ Resetar", callback_data="reset_all"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 # =========================
-# Renders — histórico de cores e de números por cor
+# Renders — históricos FIXOS (ESQ→DIR)
 # =========================
 def as_symbol(c: str) -> str:
     return "🔴" if c == "R" else ("⚫" if c == "B" else "🟢")
@@ -156,23 +160,16 @@ def render_history_grid(history: List[str]) -> str:
     return "\n".join(rendered_lines)
 
 def render_numbers_grid(nums: List[int]) -> str:
-    """
-    Renderiza números em grade fixa com NUM_HISTORY_COLS por linha.
-    Usa <code> e números 2 dígitos (02) para alinhar. Preenche com placeholder.
-    """
     if not nums:
-        return "<code>" + (NUM_PLACEHOLDER * NUM_HISTORY_COLS) + "</code>"
-    # cria blocos de 2 chars (zero-padded)
-    blocks = [f"{n:02d}" for n in nums]
+        return "<code>" + " ".join([NUM_PLACEHOLDER] * NUM_HISTORY_COLS) + "</code>"
+    blocks = [f"{n:02d}" for n in nums]  # zero vira 00
     rows: List[List[str]] = []
     for i in range(0, len(blocks), NUM_HISTORY_COLS):
         rows.append(blocks[i:i + NUM_HISTORY_COLS])
-    # pad da última
     last = rows[-1]
     if len(last) < NUM_HISTORY_COLS:
         last = last + [NUM_PLACEHOLDER] * (NUM_HISTORY_COLS - len(last))
         rows[-1] = last
-    # limitar a no máx. MAX_HISTORY_ROWS
     rows_to_show = rows[-MAX_HISTORY_ROWS:]
     rendered_lines: List[str] = []
     total_rows = len(rows)
@@ -206,7 +203,7 @@ def pretty_status(st: Dict[str, Any]) -> str:
     )
 
 # =========================
-# Estratégia /faixa (gatilho + Gale 1x)
+# Estratégia — Faixa (gatilho + Gale 1x)
 # =========================
 def last_k_nonzero(numbers: List[int], k: int) -> Optional[List[int]]:
     buf: List[int] = []
@@ -281,15 +278,12 @@ def _tick_postwin_and_maybe_reset(st: Dict[str, Any]) -> Optional[str]:
     remaining = st["postwin_wait_left"]
     if remaining > 0:
         return f"⏳ <b>Coleta pós-acerto:</b> {POSTWIN_SPINS-remaining}/{POSTWIN_SPINS}. Sem novos sinais."
-    # reset somente de históricos
     st["history"] = []
     st["numbers"] = []
-    st["red_numbers"] = []
-    st["black_numbers"] = []
     return "♻️ <b>Coleta concluída.</b> Históricos zerados. Reiniciando análise."
 
 # =========================
-# Handlers
+# Handlers — comandos e callbacks
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -310,12 +304,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "📊 <b>Status</b>\n"
         f"{pretty_status(st)}\n\n"
-        "🧩 <b>Histórico (grade fixa) — Cores:</b>\n"
+        "🧩 <b>Histórico — Cores (grade fixa):</b>\n"
         f"{render_history_grid(st['history'])}\n\n"
-        "🔴 <b>Histórico (números vermelhos):</b>\n"
-        f"{render_numbers_grid(st['red_numbers'])}\n\n"
-        "⚫ <b>Histórico (números pretos):</b>\n"
-        f"{render_numbers_grid(st['black_numbers'])}",
+        "🔢 <b>Histórico — Números (grade fixa):</b>\n"
+        f"{render_numbers_grid(st['numbers'])}",
         reply_markup=kb,
     )
 
@@ -330,12 +322,7 @@ def _append_spin(st: Dict[str, Any], n: int) -> None:
     if n == 0:
         st["history"].append("Z")
     else:
-        c = color_of(n) or "Z"
-        st["history"].append(c)
-        if c == "R":
-            st["red_numbers"].append(n)
-        elif c == "B":
-            st["black_numbers"].append(n)
+        st["history"].append(color_of(n) or "Z")
 
 def _label_color_full(n: int) -> str:
     if n == 0:
@@ -348,35 +335,27 @@ def _label_hilo(n: int) -> str:
     return "Alto" if n in HIGH_SET else "Baixo"
 
 async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
-    # 1) Atualiza histórico
     _append_spin(st, n)
-
-    # 2) Confirmação explícita
     header = f"📥 <b>Registrado:</b> {label_for_number(n)} • {_label_color_full(n)} • {_label_hilo(n)}"
-
-    # 3) Avalia pendência /faixa (com Gale)
     msgs: List[str] = [header]
+
     if st.get("pending_bucket"):
         m = evaluate_faixa_on_spin(st, n)
-        if m:
-            msgs.append(m)
+        if m: msgs.append(m)
 
-    # 4) Pós-acerto ativo?
     post_msg = _tick_postwin_and_maybe_reset(st)
     if post_msg:
         msgs.append(post_msg)
         kb = build_numeric_keyboard()
         await message_fn(
             "\n".join(msgs) + "\n\n" +
-            "🧩 <b>Histórico (grade fixa) — Cores:</b>\n" + render_history_grid(st["history"]) + "\n\n" +
-            "🔴 <b>Histórico (números vermelhos):</b>\n" + render_numbers_grid(st["red_numbers"]) + "\n\n" +
-            "⚫ <b>Histórico (números pretos):</b>\n" + render_numbers_grid(st["black_numbers"]) + "\n\n" +
+            "🧩 <b>Histórico — Cores (grade fixa):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+            "🔢 <b>Histórico — Números (grade fixa):</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
             pretty_status(st),
             reply_markup=kb
         )
         return
 
-    # 5) Se não há pendência e não está em pós-acerto, tentar gerar novo sinal
     if st.get("pending_bucket") is None and st.get("postwin_wait_left", 0) == 0 and n != 0:
         trig = faixa_trigger(st["numbers"])
         if trig:
@@ -397,39 +376,81 @@ async def _handle_spin_and_respond(message_fn, st: Dict[str, Any], n: int):
     kb = build_numeric_keyboard()
     await message_fn(
         "\n".join(msgs) + "\n\n" +
-        "🧩 <b>Histórico (grade fixa) — Cores:</b>\n" + render_history_grid(st["history"]) + "\n\n" +
-        "🔴 <b>Histórico (números vermelhos):</b>\n" + render_numbers_grid(st["red_numbers"]) + "\n\n" +
-        "⚫ <b>Histórico (números pretos):</b>\n" + render_numbers_grid(st["black_numbers"]) + "\n\n" +
+        "🧩 <b>Histórico — Cores (grade fixa):</b>\n" + render_history_grid(st["history"]) + "\n\n" +
+        "🔢 <b>Histórico — Números (grade fixa):</b>\n" + render_numbers_grid(st["numbers"]) + "\n\n" +
         pretty_status(st),
         reply_markup=kb
     )
 
-# Callback de clique nos botões numéricos
-async def on_number_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ========= Callbacks =========
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roteia todos os callback_data em um só handler."""
     query = update.callback_query
     uid = query.from_user.id
     st = get_state(uid)
+    data = (query.data or "").strip()
 
-    data = query.data or ""
-    if not data.startswith("num:"):
-        await query.answer()
-        return
-    try:
-        n = int(data.split(":")[1])
-    except Exception:
-        await query.answer()
-        return
-
-    # Toast curto
-    await query.answer(text=f"Registrado {label_for_number(n)}", show_alert=False)
-
-    async def reply_fn(text: str, reply_markup: InlineKeyboardMarkup):
+    # Número clicado?
+    if data.startswith("num:"):
         try:
-            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            n = int(data.split(":")[1])
         except Exception:
-            await query.message.reply_html(text, reply_markup=reply_markup)
+            await query.answer()
+            return
 
-    await _handle_spin_and_respond(reply_fn, st, n)
+        await query.answer(text=f"Registrado {label_for_number(n)}", show_alert=False)
+
+        async def reply_fn(text: str, reply_markup: InlineKeyboardMarkup):
+            # Tenta editar a própria mensagem; se não puder, envia uma nova
+            try:
+                await query.message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            except Exception:
+                await query.message.reply_html(text, reply_markup=reply_markup)
+
+        await _handle_spin_and_respond(reply_fn, st, n)
+        return
+
+    # Limpar (apagar) a mensagem do bot
+    if data == "clear_last":
+        await query.answer(text="Mensagem do bot apagada.", show_alert=False)
+        # apaga a mensagem do bot (essa onde clicou)
+        try:
+            await query.message.delete()
+        except Exception:
+            # se não conseguir deletar (ex.: permissões), apenas edita
+            try:
+                await query.message.edit_text("🗑️ Mensagem limpa. Informe o número correto.", reply_markup=build_numeric_keyboard(), parse_mode="HTML")
+            except Exception:
+                pass
+        # envia nova instrução
+        await query.message.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="🗑️ Mensagem apagada.\n👉 Informe o número correto clicando nos botões abaixo.",
+            reply_markup=build_numeric_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    # Resetar tudo
+    if data == "reset_all":
+        await query.answer(text="Históricos e placar resetados.", show_alert=False)
+        # apaga a mensagem do bot (essa onde clicou)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        # reseta estado e envia confirmação
+        STATE[uid] = _fresh_state()
+        await query.message.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="♻️ <b>Históricos e placar resetados.</b>",
+            reply_markup=build_numeric_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    # fallback
+    await query.answer()
 
 # (Opcional) aceitar dígitos digitados
 async def handle_digit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -490,7 +511,8 @@ async def amain():
     tg_app.add_handler(CommandHandler("status", status_cmd))
     tg_app.add_handler(CommandHandler("reset", reset_cmd))
 
-    tg_app.add_handler(CallbackQueryHandler(on_number_click))
+    # Único CallbackQueryHandler roteando números, limpar e resetar
+    tg_app.add_handler(CallbackQueryHandler(on_callback))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_digit_text))
 
     tg_app.add_error_handler(error_handler)
