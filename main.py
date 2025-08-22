@@ -221,9 +221,7 @@ def pretty_status(st: Dict[str, Any]) -> str:
         bucket_txt = f"{faixa} {cor} ({step})"
     return (
         "🏷️ <b>Status</b>\n"
-        f"• 🎯 <b>Jogadas:</b> {j}\n"
-        f"• ✅ <b>Acertos:</b> {a}\n"
-        f"• ❌ <b>Erros:</b> {e}\n"       
+        f"• 🎯 <b>Jogadas:</b> {j}" "• ✅ <b>Acertos:</b> {a}" "• ❌ <b>Erros:</b> {e}"       
     )
 
 # =========================
