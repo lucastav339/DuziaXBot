@@ -112,7 +112,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🤖 Bot de Resultados — <b>Pragmatic Brazilian Roulette</b>\n\n"
             "Assim que houver um novo giro, eu te envio aqui.\n\n"
             "Comandos:\n"
-            "• /interval <seg> — muda a frequência (ex.: /interval 10)\n"
+            "• /interval &lt;segundos&gt; — muda a frequência (ex.: /interval 10)\n"
             "• /status — mostra o status atual\n"
             "• /history — últimos 15 resultados\n"
             "• /stop — para o envio\n"
