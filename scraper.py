@@ -1,8 +1,11 @@
 import logging
 from typing import Optional, List, Dict, Literal
 
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, ClientResponseError
 from bs4 import BeautifulSoup, Tag
+
+# Fallback headless browser
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
 log = logging.getLogger("roulette-scraper")
 
@@ -15,10 +18,9 @@ UA = (
 
 class RouletteScraper:
     """
-    Scraper robusto:
-    - Tenta seletores específicos do bloco 'História das rodadas'
-    - Fallback: qualquer '.roulette-number' no documento
-    - Logs de diagnóstico para /debug
+    Estratégia:
+      1) Tentar HTTP simples (aiohttp) -> rápido
+      2) Se 403/sem itens -> fallback Playwright (Chromium headless)
     """
 
     def __init__(self, url: str):
@@ -30,15 +32,11 @@ class RouletteScraper:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": "https://gamblingcounting.com/",
         }
-        self._last_fetch_ok = None  # para debug
-        self._last_items_count = 0
-        self._last_sample_classes: List[str] = []
-        self._last_sample_numbers: List[Dict] = []
 
-    async def _fetch_html(self) -> str:
+    # ---------- AIOHTTP PATH ----------
+    async def _fetch_html_aiohttp(self) -> str:
         async with ClientSession(timeout=self._timeout, headers=self._headers) as s:
             async with s.get(self.url, allow_redirects=True) as r:
-                self._last_fetch_ok = (r.status, str(r.url))
                 r.raise_for_status()
                 return await r.text()
 
@@ -59,74 +57,107 @@ class RouletteScraper:
         n = int(txt)
         if not (0 <= n <= 36):
             return None
-        color = RouletteScraper._color_from_classes(tag)
-        return {"number": n, "color": color}
+        return {"number": n, "color": RouletteScraper._color_from_classes(tag)}
 
-    def _extract_items(self, soup: BeautifulSoup) -> List[Dict]:
-        # 1) seletor do bloco “História das rodadas”
+    def _extract_items_bs(self, html: str) -> List[Dict]:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Seletor preciso do bloco de histórico
         container = soup.select_one(
             'section[aria-labelledby="live-game-result-label"] '
             '.live-game-page__block__results.live-game-page__block__results--roulette'
         )
+
         nodes: List[Tag] = []
         if container:
             nodes = list(container.select(".roulette-number"))
-
-        # 2) fallback global
         if not nodes:
+            # fallback mais amplo
             nodes = list(soup.select(".roulette-number"))
 
         items: List[Dict] = []
-        sample_classes: List[str] = []
         for div in nodes:
             parsed = self._parse_item(div)
             if parsed:
                 items.append(parsed)
-            if len(sample_classes) < 10:
-                sample_classes.append(" ".join(div.get("class", [])))
-
-        # salvar amostras para /debug
-        self._last_items_count = len(items)
-        self._last_sample_classes = sample_classes
-        self._last_sample_numbers = items[:5]
-
         return items
 
+    # ---------- PLAYWRIGHT PATH ----------
+    async def _extract_items_playwright(self) -> List[Dict]:
+        """
+        Abre Chromium headless, navega até a página e extrai via DOM renderizado.
+        """
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=UA,
+                locale="pt-BR",
+                viewport={"width": 1280, "height": 900},
+            )
+            page = await context.new_page()
+            try:
+                await page.goto(self.url, wait_until="domcontentloaded", timeout=20000)
+                # Espera por qualquer '.roulette-number' (até 10s). Se necessário, aumente.
+                await page.wait_for_selector(".roulette-number", timeout=10000)
+
+                # Extrai diretamente do DOM os números + cores
+                data = await page.evaluate("""
+                    () => {
+                      const sel = 'section[aria-labelledby="live-game-result-label"] .live-game-page__block__results--roulette .roulette-number';
+                      let nodes = Array.from(document.querySelectorAll(sel));
+                      if (!nodes.length) nodes = Array.from(document.querySelectorAll('.roulette-number'));
+                      const items = [];
+                      for (const el of nodes) {
+                        const txt = (el.textContent || '').trim().split(/\s+/)[0];
+                        const n = parseInt(txt, 10);
+                        if (!Number.isInteger(n) || n < 0 || n > 36) continue;
+                        const cls = el.className || '';
+                        let color = 'green';
+                        if (cls.includes('roulette-number--red')) color = 'red';
+                        else if (cls.includes('roulette-number--black')) color = 'black';
+                        items.push({ number: n, color });
+                      }
+                      return items;
+                    }
+                """)
+                return data or []
+            finally:
+                await context.close()
+                await browser.close()
+
+    # ---------- API pública ----------
+    async def _get_items(self) -> List[Dict]:
+        """
+        Retorna a lista de itens (mais recente -> mais antigo).
+        Tenta aiohttp; se 403 ou vazio, usa Playwright.
+        """
+        # Primeiro: HTTP simples
+        try:
+            html = await self._fetch_html_aiohttp()
+            items = self._extract_items_bs(html)
+            if items:
+                return items
+            log.info("[scraper] AIOHTTP retornou 0 itens; tentando Playwright.")
+        except ClientResponseError as e:
+            log.warning(f"[scraper] AIOHTTP falhou: {e.status} {e.message}; tentando Playwright.")
+        except Exception as e:
+            log.warning(f"[scraper] AIOHTTP exceção: {e}; tentando Playwright.")
+
+        # Fallback: Chromium headless
+        try:
+            items = await self._extract_items_playwright()
+            return items
+        except PWTimeoutError:
+            log.error("[scraper] Playwright timeout ao aguardar elementos.")
+            return []
+        except Exception as e:
+            log.exception(f"[scraper] Playwright falhou: {e}")
+            return []
+
     async def fetch_latest_entry(self) -> Optional[Dict]:
-        """
-        Retorna o item mais recente: {"number": int, "color": "red|black|green"}
-        Assume que o DOM vem do mais recente -> mais antigo; se inverter, troque para items[-1].
-        """
-        html = await self._fetch_html()
-        soup = BeautifulSoup(html, "html.parser")
-        items = self._extract_items(soup)
-        if not items:
-            log.warning(f"[scraper] Nenhum item encontrado. fetch={self._last_fetch_ok}")
-            return None
-        return items[0]
+        items = await self._get_items()
+        return items[0] if items else None
 
     async def fetch_history(self, limit: int = 15) -> List[Dict]:
-        html = await self._fetch_html()
-        soup = BeautifulSoup(html, "html.parser")
-        items = self._extract_items(soup)
+        items = await self._get_items()
         return items[:limit]
-
-    # -------- utilitário de debug --------
-    async def debug_snapshot(self) -> Dict:
-        try:
-            html = await self._fetch_html()
-            soup = BeautifulSoup(html, "html.parser")
-            _ = self._extract_items(soup)
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": str(e),
-                "last_fetch": self._last_fetch_ok,
-            }
-        return {
-            "ok": True,
-            "fetch": self._last_fetch_ok,                # (status, url_resolvida)
-            "items_found": self._last_items_count,       # quantos números parseados
-            "sample_classes": self._last_sample_classes, # até 10 classes encontradas
-            "sample_numbers": self._last_sample_numbers, # até 5 itens parseados
-        }
