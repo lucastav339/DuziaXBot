@@ -1,24 +1,40 @@
 import os
 from contextlib import asynccontextmanager
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-
-# Playwright (headless browser)
 from playwright.async_api import async_playwright
 
 TARGET_URL = "https://gamblingcounting.com/pt/pragmatic-brazilian-roulette"
+
+# ====== Servidor de saúde (Render exige porta aberta) ======
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"🌐 Health server rodando em http://0.0.0.0:{port}/health")
+    return server
 
 # ====== Navegador headless compartilhado (abre uma vez e reutiliza) ======
 _browser = {"playwright": None, "browser": None, "context": None, "page": None}
 
 @asynccontextmanager
 async def browser_context():
-    # Reutiliza entre chamadas para ficar rápido
     if _browser["browser"] is None:
         pw = await async_playwright().start()
         _browser["playwright"] = pw
-        # No Render/Ubuntu, use chromium com flags seguras
         browser = await pw.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"
         ])
@@ -28,16 +44,10 @@ async def browser_context():
     try:
         yield _browser["page"]
     finally:
-        # mantemos aberto para reutilização; feche no shutdown se quiser
         pass
 
 async def extract_last_spin(page):
-    """
-    Abre a página e tenta identificar o primeiro item da 'História dos rounds'.
-    Retorna (numero:int, cor:str) onde cor ∈ {'Vermelho','Preto','Verde'}.
-    """
     await page.goto(TARGET_URL, wait_until="domcontentloaded")
-    # Aguarda JS hidratar a seção do histórico
     await page.wait_for_timeout(1500)
 
     data = await page.evaluate("""
@@ -112,7 +122,6 @@ async def extract_last_spin(page):
     return numero, cor
 
 # ========= Handlers do Telegram =========
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     try:
@@ -132,7 +141,6 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("OK")
 
 async def on_shutdown(app: Application):
-    # Fecha Playwright no desligamento
     try:
         if _browser["context"]:
             await _browser["context"].close()
@@ -148,12 +156,14 @@ def main():
     if not token:
         raise RuntimeError("Defina a variável de ambiente BOT_TOKEN com o token do seu bot.")
 
+    # 🔹 inicia servidor de saúde para o Render
+    start_health_server()
+
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
-    app.post_shutdown = on_shutdown  # chama fechamento do Playwright ao encerrar
+    app.post_shutdown = on_shutdown
 
-    # run_polling é bloqueante e gerencia o loop internamente
     app.run_polling()
 
 if __name__ == "__main__":
