@@ -1,18 +1,14 @@
-FROM python:3.11-slim
+# Usa a imagem do Playwright já com deps do Chromium
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
-
-RUN apt-get update && apt-get install -y \
-    wget gnupg ca-certificates \
-    libnss3 libxkbcommon0 libasound2 libgbm1 libgtk-3-0 libx11-xcb1 \
-    libxcomposite1 libxdamage1 libxrandr2 libxshmfence1 \
-    fonts-liberation libxss1 xdg-utils \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
-RUN python -m playwright install --with-deps chromium
+
+# Os browsers já vêm prontos nessa imagem; se quiser garantir:
+RUN playwright install chromium
 
 COPY . .
 CMD ["python", "app.py"]
